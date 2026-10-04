@@ -27,6 +27,12 @@ public enum CoordinationErrorCode {
     /** 位点或任期发生回退，检查点/日志被显式拒绝 */
     CHECKPOINT_ROLLBACK,
 
+    /**
+     * 掉队太远：所需历史已被压缩且超出领导者保留窗口，
+     * 既不能靠存档补齐（拿到的存档反而比本地旧）也不能从中间位点续传，必须显式挡回
+     */
+    BEYOND_RECOVERY_WINDOW,
+
     /** 其他内部错误 */
     INTERNAL
 }

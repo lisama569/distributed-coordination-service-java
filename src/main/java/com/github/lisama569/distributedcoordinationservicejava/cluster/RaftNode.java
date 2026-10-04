@@ -1,22 +1,24 @@
 package com.github.lisama569.distributedcoordinationservicejava.cluster;
 
+import com.github.lisama569.distributedcoordinationservicejava.compaction.LogCompactor;
 import com.github.lisama569.distributedcoordinationservicejava.core.CoordinationErrorCode;
 import com.github.lisama569.distributedcoordinationservicejava.core.CoordinationException;
 import com.github.lisama569.distributedcoordinationservicejava.core.SimClock;
 import com.github.lisama569.distributedcoordinationservicejava.log.LogEntry;
 import com.github.lisama569.distributedcoordinationservicejava.recovery.Checkpoint;
 import com.github.lisama569.distributedcoordinationservicejava.recovery.DurableStorage;
+import com.github.lisama569.distributedcoordinationservicejava.recovery.Snapshot;
 import com.github.lisama569.distributedcoordinationservicejava.statemachine.KvStateMachine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * 单个 Raft 风格节点，使用共享的逻辑时钟驱动，全部在进程内运行，不涉及真实网络与线程。
@@ -34,6 +36,17 @@ import java.util.Set;
  *   <li>失去多数派后 TTL 内无法续约，{@link #propose} 一律以 LEASE_EXPIRED/NOT_LEADER 拒绝；</li>
  *   <li>分区恢复时旧领导者一旦收到更高 term 响应/请求立即下台，绝不以旧 term 接受写。</li>
  * </ul>
+ *
+ * <h3>历史压缩与追赶</h3>
+ * <ul>
+ *   <li>已应用日志达到可配置阈值后，{@link LogCompactor} 把较早历史整理成存档，
+ *       存档只包含已提交并应用的内容；</li>
+ *   <li>恢复顺序固定为“先安装存档 -> 再补存档位点之后的增量”，结果与完整重放一致；</li>
+ *   <li>心跳发现对端所需位点已被自己压缩时改用 InstallSnapshot 发完整存档；
+ *       追赶期间不阻塞正常写入，每条增量只应用一次；</li>
+ *   <li>超出可恢复窗口（拿到的存档比本地旧、或本地历史出现无法跨越的空洞）
+ *       一律以 {@code BEYOND_RECOVERY_WINDOW} 显式拒绝，不假装追平、不从中间位点续传。</li>
+ * </ul>
  */
 public class RaftNode {
 
@@ -47,8 +60,13 @@ public class RaftNode {
     private final long electionTimeoutMillis;
     private final long heartbeatIntervalMillis;
     private final long leaseTtlMillis;
+    private final long compactionThresholdEntries;
     /** 每个节点固定的选举超时扰动，避免同时超时导致分票 */
     private final long electionJitter;
+
+    /** 实时应用/安装存档的监听回调（由集群模拟器接到 WriteCoordinator，恢复重放不回调） */
+    private Consumer<LogEntry> appliedListener;
+    private Consumer<Snapshot> snapshotListener;
 
     // ---- 持久化状态（内存镜像，权威数据在 storage） ----
     private long currentTerm;
@@ -72,6 +90,14 @@ public class RaftNode {
                     KvStateMachine stateMachine, ClusterTransport transport,
                     long electionTimeoutMillis, long heartbeatIntervalMillis,
                     long leaseTtlMillis) {
+        this(nodeId, clock, storage, stateMachine, transport,
+                electionTimeoutMillis, heartbeatIntervalMillis, leaseTtlMillis, 0L);
+    }
+
+    public RaftNode(String nodeId, SimClock clock, DurableStorage storage,
+                    KvStateMachine stateMachine, ClusterTransport transport,
+                    long electionTimeoutMillis, long heartbeatIntervalMillis,
+                    long leaseTtlMillis, long compactionThresholdEntries) {
         this.nodeId = nodeId;
         this.clock = clock;
         this.storage = storage;
@@ -80,10 +106,20 @@ public class RaftNode {
         this.electionTimeoutMillis = electionTimeoutMillis;
         this.heartbeatIntervalMillis = heartbeatIntervalMillis;
         this.leaseTtlMillis = leaseTtlMillis;
+        this.compactionThresholdEntries = compactionThresholdEntries;
         // 以节点号做确定性扰动，保证各节点超时时刻错开且可重现
         this.electionJitter = Math.floorMod(nodeId.hashCode(), 25L);
         recover();
         resetElectionTimer();
+    }
+
+    /** 注册实时应用/存档回调（在节点参与集群前由模拟器接线）。 */
+    public void setAppliedListener(Consumer<LogEntry> appliedListener) {
+        this.appliedListener = appliedListener;
+    }
+
+    public void setSnapshotListener(Consumer<Snapshot> snapshotListener) {
+        this.snapshotListener = snapshotListener;
     }
 
     // ==================== 崩溃恢复 ====================
@@ -92,20 +128,40 @@ public class RaftNode {
         Checkpoint cp = storage.loadCheckpoint();
         this.currentTerm = cp.currentTerm();
         this.votedFor = cp.votedFor();
+
+        // 固定恢复顺序：先安装存档（若有），再按序重放之后的已提交增量。
+        Optional<Snapshot> snap = storage.loadSnapshot();
+        long replayFrom = 1L;
+        if (snap.isPresent()) {
+            Snapshot s = snap.get();
+            stateMachine.installSnapshot(s);
+            replayFrom = s.lastIncludedIndex() + 1L;
+            log.info("[recover node={}] 先加载历史存档: snapshotIndex={} term={} 状态键={} 幂等记录={}",
+                    nodeId, s.lastIncludedIndex(), s.lastIncludedTerm(),
+                    s.state().size(), s.idempotent().size());
+        }
         this.commitIndex = cp.appliedIndex();
         this.lastApplied = cp.appliedIndex();
-        // 把已提交日志按顺序重放到状态机；同一位点重放不产生重复效果
-        for (long i = 1L; i <= lastApplied; i++) {
+
+        // 无存档时只能从 index=1 开始重放；有存档时从存档边界之后重放。
+        // 任何一段缺失都意味着本地历史存在无法跨越的空洞，必须显式拒绝恢复，
+        // 而不是静默跳过（否则等于假装追平 / 从中间位点续传）。
+        for (long i = replayFrom; i <= lastApplied; i++) {
             LogEntry e = storage.loadEntry(i);
-            if (e != null) {
-                stateMachine.apply(i, keyOf(e), e.value());
+            if (e == null) {
+                throw new CoordinationException(CoordinationErrorCode.BEYOND_RECOVERY_WINDOW,
+                        "恢复失败: 所需 index=" + i + " 的历史已超出保留窗口（存档位点="
+                                + (replayFrom - 1L) + ", 现存 first=" + storage.firstIndex()
+                                + ", last=" + storage.lastIndex()
+                                + "），禁止假装追平或从中间位点续传");
             }
+            stateMachine.apply(i, keyOf(e), e.value());
         }
         this.role = NodeRole.FOLLOWER;
         this.leaderId = null;
         this.leaseExpireAtMillis = Long.MIN_VALUE;
-        log.info("[recover node={}] 从检查点恢复: term={}, lastIndex={}, appliedIndex={}",
-                nodeId, currentTerm, storage.lastIndex(), lastApplied);
+        log.info("[recover node={}] 恢复完成: term={}, 保留窗口[first={}, last={}], appliedIndex={}",
+                nodeId, currentTerm, storage.firstIndex(), storage.lastIndex(), lastApplied);
     }
 
     // ==================== 时钟驱动 ====================
@@ -192,14 +248,14 @@ public class RaftNode {
         for (String peer : transport.nodeIds()) {
             if (!peer.equals(nodeId)) {
                 nextIndex.put(peer, localLastIndex() + 1L);
-                matchIndex.put(peer, 0L);
+                matchIndex.put(peer, snapshotIndex());
             }
         }
         // 当选即发一轮心跳：既宣告领导权，也尝试立刻获得多数派 ACK 以建立租约
         broadcastHeartbeats();
         nextHeartbeatAt = clock.nowMillis() + heartbeatIntervalMillis;
-        log.info("[elect node={}] 成为领导者 term={} 集群规模={}",
-                nodeId, currentTerm, transport.nodeIds().size());
+        log.info("[elect node={}] 成为领导者 term={} 集群规模={} 存档位点={}",
+                nodeId, currentTerm, transport.nodeIds().size(), snapshotIndex());
     }
 
     private void becomeFollower(long term, String newLeaderId) {
@@ -261,7 +317,7 @@ public class RaftNode {
         }
     }
 
-    // ==================== 心跳与复制 ====================
+    // ==================== 心跳、复制与存档追赶 ====================
 
     private void broadcastHeartbeats() {
         int total = transport.nodeIds().size();
@@ -271,8 +327,18 @@ public class RaftNode {
                 continue;
             }
             long ni = nextIndex.getOrDefault(peer, localLastIndex() + 1L);
+
+            // 对端下一条需要的位点已经被本节点压缩掉：只能用完整存档追赶
+            if (ni <= snapshotIndex()) {
+                if (!sendSnapshotToPeer(peer)) {
+                    continue;
+                }
+                acks++;
+                continue;
+            }
+
             long prevLogIndex = ni - 1L;
-            long prevLogTerm = prevLogIndex == 0L ? 0L : termAt(prevLogIndex);
+            long prevLogTerm = termAt(prevLogIndex);
             List<LogEntry> batch = storage.loadEntries(ni);
             AppendRequest request = new AppendRequest(currentTerm, nodeId, prevLogIndex,
                     prevLogTerm, commitIndex, batch);
@@ -294,8 +360,16 @@ public class RaftNode {
                 matchIndex.put(peer, matched);
                 nextIndex.put(peer, matched + 1L);
             } else {
-                // 对端日志落后或冲突：nextIndex 回退一格，下一轮继续追
-                nextIndex.put(peer, Math.max(1L, ni - 1L));
+                long peerLast = resp.lastLogIndex();
+                if (peerLast < snapshotIndex()) {
+                    // 对端的历史已落在本节点存档覆盖范围内 -> 下一轮直接发存档
+                    nextIndex.put(peer, 1L);
+                    log.info("[catchup node={}] 对端 {} 落后到存档覆盖范围(peerLast={} snapshotIndex={})，下一轮发完整存档",
+                            nodeId, peer, peerLast, snapshotIndex());
+                } else {
+                    // 普通冲突/落后：回退到对端实际位点之后，逐轮补增量
+                    nextIndex.put(peer, Math.max(storage.firstIndex(), peerLast + 1L));
+                }
             }
         }
         if (role != NodeRole.LEADER) {
@@ -308,9 +382,40 @@ public class RaftNode {
         applyCommitted();
     }
 
+    private boolean sendSnapshotToPeer(String peer) {
+        Snapshot s = storage.loadSnapshot().orElse(null);
+        if (s == null) {
+            // 本地没有存档却要求对端从更早位点开始：对端已超出本节点的可恢复窗口
+            log.warn("[catchup node={}] 对端 {} 需要的历史早于本节点保留窗口(first={})且无存档可发",
+                    nodeId, peer, storage.firstIndex());
+            return false;
+        }
+        Optional<InstallSnapshotResponse> reply = transport.sendInstallSnapshot(
+                nodeId, peer, new InstallSnapshotRequest(currentTerm, nodeId, s));
+        if (reply.isEmpty()) {
+            return false;
+        }
+        InstallSnapshotResponse resp = reply.get();
+        if (resp.term() > currentTerm) {
+            becomeFollower(resp.term(), null);
+            return false;
+        }
+        if (role != NodeRole.LEADER) {
+            return false;
+        }
+        if (!resp.success()) {
+            return false;
+        }
+        matchIndex.put(peer, s.lastIncludedIndex());
+        nextIndex.put(peer, s.lastIncludedIndex() + 1L);
+        log.info("[catchup node={}] 向 {} 安装存档成功 snapshotIndex={} term={}，随后补增量",
+                nodeId, peer, s.lastIncludedIndex(), s.lastIncludedTerm());
+        return true;
+    }
+
     public AppendResponse handleAppendEntries(AppendRequest request) {
         if (request.term() < currentTerm) {
-            return new AppendResponse(currentTerm, false, 0L);
+            return AppendResponse.mismatch(currentTerm, storage.lastIndex());
         }
         if (request.term() > currentTerm) {
             becomeFollower(request.term(), request.leaderId());
@@ -322,27 +427,66 @@ public class RaftNode {
         }
         long prevIndex = request.prevLogIndex();
         long prevTerm = request.prevLogTerm();
-        if (prevIndex > 0L) {
+        long myK = snapshotIndex();
+
+        if (prevIndex < myK) {
+            // 领导者拿已被我存档覆盖的位点来当前置：它的存档比我旧，我不能降级
+            log.info("[catchup node={}] 拒绝增量: 前置位点 {} 已被本地存档(K={})覆盖 (依据: 超出可恢复窗口，不接受更旧的历史)",
+                    nodeId, prevIndex, myK);
+            return AppendResponse.mismatch(currentTerm, storage.lastIndex());
+        }
+        if (prevIndex == myK && myK > 0L) {
+            if (prevTerm != termAt(prevIndex)) {
+                throw new CoordinationException(CoordinationErrorCode.CHECKPOINT_ROLLBACK,
+                        "存档边界任期不一致: snapshotIndex=" + myK
+                                + " snapshotTerm=" + termAt(prevIndex)
+                                + " requestPrevTerm=" + prevTerm);
+            }
+        } else if (prevIndex > myK) {
             LogEntry prev = storage.loadEntry(prevIndex);
-            if (prev == null || prev.term() != prevTerm) {
-                log.debug("[append node={}] 拒绝: prevLog[{}/term={}] 不匹配",
+            if (prev == null && prevIndex <= storage.lastIndex()) {
+                // 前置位点落在存档之后、本地最后位点之前却没有条目：
+                // 本地历史出现无法跨越的空洞（离线期间区段已被物理回收）
+                throw new CoordinationException(CoordinationErrorCode.BEYOND_RECOVERY_WINDOW,
+                        "拒绝增量: 前置位点 " + prevIndex + " 处本地历史存在空洞（first="
+                                + storage.firstIndex() + ", last=" + storage.lastIndex()
+                                + ", snapshotK=" + myK + "），禁止从中间位点续传");
+            }
+            if (prev == null) {
+                // 本地比领导者短：回退一位继续探，逐轮补增量
+                return AppendResponse.mismatch(currentTerm, storage.lastIndex());
+            }
+            if (prev.term() != prevTerm) {
+                log.debug("[append node={}] 拒绝: prevLog[{}/term={}] 任期冲突",
                         nodeId, prevIndex, prevTerm);
-                return new AppendResponse(currentTerm, false, 0L);
+                // 前置检查不过：不动本地日志，回退领导者的 nextIndex；
+                // 真正的冲突条目会在 incoming 逐条处理时按标准 Raft 截断覆盖。
+                return AppendResponse.mismatch(currentTerm, storage.lastIndex());
             }
         }
+
         long baseIndex = prevIndex;
         for (LogEntry incoming : request.entries()) {
             long idx = baseIndex + 1L;
+            if (idx <= myK) {
+                // 该条目已被存档覆盖：不可能与存档不同，跳过
+                baseIndex = idx;
+                continue;
+            }
             LogEntry existing = storage.loadEntry(idx);
             if (existing == null) {
+                if (idx != storage.lastIndex() + 1L) {
+                    throw new CoordinationException(CoordinationErrorCode.BEYOND_RECOVERY_WINDOW,
+                            "拒绝在历史空洞上追加: idx=" + idx + " lastIndex=" + storage.lastIndex()
+                                    + " firstIndex=" + storage.firstIndex());
+                }
                 storage.appendEntry(new LogEntry(idx, incoming.term(),
                         incoming.idempotencyKey(), incoming.value()));
             } else if (existing.term() != incoming.term()) {
-                // 冲突：本模拟没有截断 API，而单领导者顺序提交下不会走到这里；
-                // 显式拒绝比静默覆盖安全。
-                throw new CoordinationException(CoordinationErrorCode.CHECKPOINT_ROLLBACK,
-                        "日志在 index=" + idx + " 处任期冲突: existing=" + existing.term()
-                                + ", incoming=" + incoming.term());
+                // 冲突：覆盖未提交的本地尾巴（标准 Raft 截断），随后追加领导者条目
+                storage.truncateSuffixFrom(idx);
+                storage.appendEntry(new LogEntry(idx, incoming.term(),
+                        incoming.idempotencyKey(), incoming.value()));
             }
             // existing 且 term 相同：幂等忽略（重复投递）
             baseIndex = idx;
@@ -352,8 +496,55 @@ public class RaftNode {
             persistAppliedCheckpoint();
         }
         applyCommitted();
-        long matched = prevIndex + request.entries().size();
-        return new AppendResponse(currentTerm, true, matched);
+        long matched = baseIndex;
+        return AppendResponse.ok(currentTerm, matched);
+    }
+
+    /** 接收领导者的完整存档（追赶）。 */
+    public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
+        if (request.term() < currentTerm) {
+            return new InstallSnapshotResponse(currentTerm, false, lastApplied);
+        }
+        if (request.term() > currentTerm) {
+            becomeFollower(request.term(), request.leaderId());
+        } else {
+            role = NodeRole.FOLLOWER;
+            leaderId = request.leaderId();
+            resetElectionTimer();
+        }
+        Snapshot incoming = request.snapshot();
+        long myK = snapshotIndex();
+        if (incoming.lastIncludedIndex() < myK) {
+            // 显式挡回：不允许用更旧的存档覆盖较新的状态，也不悄悄从中间位点续传
+            throw new CoordinationException(CoordinationErrorCode.BEYOND_RECOVERY_WINDOW,
+                    "拒绝安装更旧的存档: incomingK=" + incoming.lastIncludedIndex()
+                            + " localK=" + myK + "（已超出该存档的可恢复窗口）");
+        }
+        if (incoming.lastIncludedIndex() == myK) {
+            if (incoming.lastIncludedTerm() != storage.loadSnapshot()
+                    .map(Snapshot::lastIncludedTerm).orElse(-1L)) {
+                throw new CoordinationException(CoordinationErrorCode.CHECKPOINT_ROLLBACK,
+                        "同位点存档任期不一致: K=" + myK
+                                + " incomingTerm=" + incoming.lastIncludedTerm());
+            }
+            // 幂等：已安装同位点存档，直接确认
+            return new InstallSnapshotResponse(currentTerm, true, myK);
+        }
+
+        // 安装顺序：先落盘存档（会物理删除其覆盖范围的旧日志，覆盖范围外的尾巴保留，
+        // 若与存档边界恰好续接且任期一致则仍可用，否则由后续 AppendEntries 冲突截断处理）
+        storage.installSnapshot(incoming);
+        stateMachine.installSnapshot(incoming);
+        lastApplied = incoming.lastIncludedIndex();
+        commitIndex = Math.max(commitIndex, incoming.lastIncludedIndex());
+        persistAppliedCheckpoint();
+        if (snapshotListener != null) {
+            snapshotListener.accept(incoming);
+        }
+        log.info("[catchup node={}] 安装历史存档 snapshotIndex={} term={} 状态键={}，等待后续增量",
+                nodeId, incoming.lastIncludedIndex(), incoming.lastIncludedTerm(),
+                incoming.state().size());
+        return new InstallSnapshotResponse(currentTerm, true, incoming.lastIncludedIndex());
     }
 
     public void handleAppendResponse(String fromId, AppendResponse response) {
@@ -395,9 +586,27 @@ public class RaftNode {
             String appliedValue = stateMachine.apply(idx, keyOf(entry), entry.value());
             lastApplied = idx;
             persistAppliedCheckpoint();
+            if (appliedListener != null) {
+                appliedListener.accept(entry);
+            }
             log.info("[apply node={}] 应用日志 index={} term={} idempotencyKey={} value={}",
                     nodeId, idx, entry.term(), entry.idempotencyKey(), appliedValue);
         }
+        // 应用之后检查历史压缩：只压缩已经落定生效的部分
+        maybeCompactHistory();
+    }
+
+    private void maybeCompactHistory() {
+        if (compactionThresholdEntries <= 0L) {
+            return;
+        }
+        LogCompactor compactor = new LogCompactor(storage, stateMachine, compactionThresholdEntries);
+        compactor.maybeCompact(lastApplied).ifPresent(k -> {
+            // 存档落盘后内存位点不变（存档位点 == 已应用位点的子集）；
+            // 内存去重表的存档装载由 snapshotListener 之外的 restore 保证，
+            // 实时路径下去重表本来就已包含这些键，无需额外动作。
+            log.debug("[compaction node={}] 自动压缩到存档位点={}", nodeId, k);
+        });
     }
 
     // ==================== 写入 ====================
@@ -421,7 +630,8 @@ public class RaftNode {
         LogEntry entry = new LogEntry(index, currentTerm, idempotencyKey, value);
         storage.appendEntry(entry);
 
-        // 立即同步复制一轮：多数派 ACK 则续约+提交；否则按失去多数派处理
+        // 立即同步复制一轮：多数派 ACK 则续约+提交；否则按失去多数派处理。
+        // 这一轮心跳同时会为落后节点安装存档/补增量，追赶与写入互不阻塞。
         broadcastHeartbeats();
 
         if (role != NodeRole.LEADER) {
@@ -435,7 +645,8 @@ public class RaftNode {
         }
         log.info("[write node={}] 写入已提交 index={} term={} idempotencyKey={}",
                 nodeId, index, currentTerm, idempotencyKey);
-        return storage.loadEntry(index);
+        // 直接返回内存中的条目：该位点可能在本轮提交后立即被压缩进存档，磁盘 loadEntry 会返回 null
+        return entry;
     }
 
     // ==================== 辅助 ====================
@@ -452,9 +663,23 @@ public class RaftNode {
         return storage.lastTerm();
     }
 
+    private long snapshotIndex() {
+        return storage.loadSnapshot().map(Snapshot::lastIncludedIndex).orElse(0L);
+    }
+
+    /** 取位点对应的任期：先查保留日志，查不到再查存档边界。 */
     private long termAt(long index) {
+        if (index <= 0L) {
+            return 0L;
+        }
         LogEntry e = storage.loadEntry(index);
-        return e == null ? 0L : e.term();
+        if (e != null) {
+            return e.term();
+        }
+        return storage.loadSnapshot()
+                .filter(s -> s.lastIncludedIndex() == index)
+                .map(Snapshot::lastIncludedTerm)
+                .orElse(0L);
     }
 
     private void persistTermAndVote() {
@@ -496,6 +721,16 @@ public class RaftNode {
         return lastApplied;
     }
 
+    /** 本地历史压缩位点（无存档时为 0）。 */
+    public long getSnapshotIndex() {
+        return snapshotIndex();
+    }
+
+    /** 本地保留日志的最早位点（压缩后 > 1）。 */
+    public long getFirstLogIndex() {
+        return storage.firstIndex();
+    }
+
     public boolean isLeader() {
         return role == NodeRole.LEADER;
     }
@@ -510,10 +745,6 @@ public class RaftNode {
     }
 
     public List<LogEntry> logView() {
-        return storage.loadEntries(1L);
-    }
-
-    public static UnsupportedOperationException todo() {
-        return new UnsupportedOperationException("尚未实现");
+        return storage.loadEntries(storage.firstIndex());
     }
 }

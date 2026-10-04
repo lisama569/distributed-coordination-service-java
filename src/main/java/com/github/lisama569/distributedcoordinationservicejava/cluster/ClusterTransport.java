@@ -17,4 +17,8 @@ public interface ClusterTransport {
 
     /** 从 from 向 to 发送复制/心跳请求；被分区隔离时返回 empty。 */
     Optional<AppendResponse> sendAppendEntries(String from, String to, AppendRequest request);
+
+    /** 从 from 向 to 发送存档安装请求（追赶）；被分区隔离时返回 empty。 */
+    Optional<InstallSnapshotResponse> sendInstallSnapshot(String from, String to,
+                                                          InstallSnapshotRequest request);
 }

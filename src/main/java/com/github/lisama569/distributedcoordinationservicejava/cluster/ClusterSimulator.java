@@ -25,6 +25,9 @@ import java.util.Set;
  *   <li>所有节点共享一个 {@link SimClock}，{@link #advance(long)} 推进一拍并让各节点 tick；</li>
  *   <li>{@link #isolate(String)} 把节点与其余节点双向隔离，模拟网络分区；{@link #healPartition()} 恢复；</li>
  *   <li>{@link #crash(String)} 丢弃节点内存对象（磁盘保留），{@link #restart(String)} 用同一磁盘重启；</li>
+ *   <li>{@link #joinNewNode(String)} 以一块空白磁盘让新节点加入，由领导者通过“存档+增量”补齐；</li>
+ *   <li>{@link #simulateOfflineRetentionGc} 模拟节点离线期间其本地区段被保留策略物理回收，
+ *       用于制造“掉队太远、超出可恢复窗口”的场景；</li>
  *   <li>RPC 经 {@link ClusterTransport} 直接调用目标节点，分区/崩溃时返回 empty（即超时）。</li>
  * </ul>
  * 全部同步执行、无真实线程与网络，场景结论完全确定可复现。
@@ -45,6 +48,8 @@ public class ClusterSimulator implements ClusterTransport {
     private long electionTimeoutMillis = 100L;
     private long heartbeatIntervalMillis = 30L;
     private long leaseTtlMillis = 60L;
+    /** 节点本地保留的已应用日志条数达到该阈值即自动压缩；<=0 关闭压缩 */
+    private long compactionThresholdEntries = 8L;
 
     public ClusterSimulator() {
         this.clock = new SimClock(0L);
@@ -58,19 +63,41 @@ public class ClusterSimulator implements ClusterTransport {
         }
     }
 
+    /** 用既有磁盘（崩溃重启）或空白磁盘（首次出现）组装节点。 */
     public void addNode(String nodeId) {
         DurableStorage disk = disks.computeIfAbsent(nodeId, k -> new InMemoryDisk());
+        assembleNode(nodeId, disk);
+    }
+
+    /**
+     * 全新节点加入：使用一块空白磁盘，没有任何历史。
+     * 它先靠领导者的 InstallSnapshot 存档（若集群已压缩过）再补增量追上。
+     */
+    public void joinNewNode(String nodeId) {
+        InMemoryDisk fresh = new InMemoryDisk();
+        disks.put(nodeId, fresh);
+        assembleNode(nodeId, fresh);
+        log.info("[cluster] 新节点 {} 以空白磁盘加入，等待存档+增量追赶", nodeId);
+    }
+
+    private void assembleNode(String nodeId, DurableStorage disk) {
         // 崩溃会丢失内存状态：每次（重新）组装节点都给一个全新状态机，
-        // 由 RaftNode.recover() 重放已提交日志重建。
+        // 由 RaftNode.recover() 先装存档、再重放已提交增量重建。
         KvStateMachine sm = new KvStateMachine();
         RaftNode node = new RaftNode(nodeId, clock, disk, sm, this,
-                electionTimeoutMillis, heartbeatIntervalMillis, leaseTtlMillis);
+                electionTimeoutMillis, heartbeatIntervalMillis, leaseTtlMillis,
+                compactionThresholdEntries);
         WriteCoordinator coordinator = new WriteCoordinator(clock, disk);
+        // 恢复重放期间 listener 尚未接线：去重表只由 restore 从存档+已应用日志重建，
+        // 避免把“重放”误计成新的应用。
         coordinator.restore();
+        node.setAppliedListener(coordinator::onEntryApplied);
+        node.setSnapshotListener(coordinator::loadFromSnapshot);
         nodes.put(nodeId, node);
         coordinators.put(nodeId, coordinator);
         crashed.remove(nodeId);
-        log.info("[cluster] 节点上线 {} (term={})", nodeId, node.getCurrentTerm());
+        log.info("[cluster] 节点上线 {} (term={}, snapshotIndex={}, firstIndex={})",
+                nodeId, node.getCurrentTerm(), node.getSnapshotIndex(), node.getFirstLogIndex());
     }
 
     public LockService lockService() {
@@ -132,19 +159,37 @@ public class ClusterSimulator implements ClusterTransport {
         coordinators.remove(nodeId);
         crashed.add(nodeId);
         if (removed != null) {
-            log.info("[cluster] 节点崩溃 {} (磁盘保留: lastIndex={})",
-                    nodeId, disks.get(nodeId).lastIndex());
+            log.info("[cluster] 节点崩溃 {} (磁盘保留: first={}, last={}, snapshotK={})",
+                    nodeId, disks.get(nodeId).firstIndex(), disks.get(nodeId).lastIndex(),
+                    removed.getSnapshotIndex());
         }
     }
 
-    /** 用同一块磁盘重启节点：恢复任期/日志/检查点，并重建幂等去重表。 */
+    /** 用同一块磁盘重启节点：先装存档、再补增量恢复，并重建幂等去重表。 */
     public void restart(String nodeId) {
         if (!disks.containsKey(nodeId)) {
             throw new IllegalArgumentException("未知节点，无法重启: " + nodeId);
         }
         addNode(nodeId);
-        log.info("[cluster] 节点重启完成 {} term={} lastIndex={}",
-                nodeId, node(nodeId).getCurrentTerm(), disks.get(nodeId).lastIndex());
+        log.info("[cluster] 节点重启完成 {} term={} first={} last={}",
+                nodeId, node(nodeId).getCurrentTerm(),
+                disks.get(nodeId).firstIndex(), disks.get(nodeId).lastIndex());
+    }
+
+    /**
+     * 测试钩子：模拟节点离线（崩溃）期间，其本地 [1,upToIndex] 区段被保留策略
+     * 物理回收。磁盘仍能加载存档，但存档之后被回收的位点无法再提供，
+     * 用来制造“掉队太远、超出可恢复窗口”的节点。
+     */
+    public void simulateOfflineRetentionGc(String nodeId, long upToIndex) {
+        DurableStorage disk = disks.get(nodeId);
+        if (!(disk instanceof InMemoryDisk mem)) {
+            throw new IllegalStateException("仅 InMemoryDisk 支持模拟回收");
+        }
+        mem.simulateOfflineRetentionGcUpTo(upToIndex);
+        log.info("[cluster] 模拟节点 {} 离线期间本地日志被物理回收至 index={}（现存 first={}, last={}, snapshotK={}）",
+                nodeId, upToIndex, disk.firstIndex(), disk.lastIndex(),
+                disk.loadSnapshot().map(s -> s.lastIncludedIndex()).orElse(0L));
     }
 
     // ---------------- 网络分区 ----------------
@@ -191,6 +236,16 @@ public class ClusterSimulator implements ClusterTransport {
         return Optional.of(target.handleAppendEntries(request));
     }
 
+    @Override
+    public Optional<InstallSnapshotResponse> sendInstallSnapshot(String from, String to,
+                                                                 InstallSnapshotRequest request) {
+        RaftNode target = nodes.get(to);
+        if (target == null || unreachable(from, to)) {
+            return Optional.empty();
+        }
+        return Optional.of(target.handleInstallSnapshot(request));
+    }
+
     private boolean unreachable(String a, String b) {
         return partitioned.contains(a) || partitioned.contains(b)
                 || crashed.contains(a) || crashed.contains(b);
@@ -219,6 +274,10 @@ public class ClusterSimulator implements ClusterTransport {
         return coordinators.get(nodeId);
     }
 
+    public DurableStorage disk(String nodeId) {
+        return disks.get(nodeId);
+    }
+
     public long getElectionTimeoutMillis() {
         return electionTimeoutMillis;
     }
@@ -241,5 +300,13 @@ public class ClusterSimulator implements ClusterTransport {
 
     public void setLeaseTtlMillis(long v) {
         this.leaseTtlMillis = v;
+    }
+
+    public long getCompactionThresholdEntries() {
+        return compactionThresholdEntries;
+    }
+
+    public void setCompactionThresholdEntries(long v) {
+        this.compactionThresholdEntries = v;
     }
 }

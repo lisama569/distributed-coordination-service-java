@@ -40,6 +40,7 @@ public class DemoScenarioRunner implements ApplicationRunner {
         demoLeaseLockFailures();
         demoPartitionHealNoDualLeader();
         demoIdempotencyAndCrashRecovery();
+        demoCompactionAndCatchUp();
         log.info("================ 本地演示结束 ================");
     }
 
@@ -123,11 +124,45 @@ public class DemoScenarioRunner implements ApplicationRunner {
                 afterRestart.dedupHit(), afterRestart.index());
     }
 
+    private void demoCompactionAndCatchUp() {
+        log.info("---- 场景5：历史压缩（存档）+ 落后节点存档追赶 ----");
+        // 演示专用：阈值调小，便于在少量写入下观察压缩
+        ClusterSimulator cluster = new ClusterSimulator(3);
+        cluster.setCompactionThresholdEntries(5L);
+        for (int i = 1; i <= 3; i++) {
+            cluster.addNode("node" + i);
+        }
+        String leaderId = cluster.awaitLeader();
+        RaftNode leader = cluster.node(leaderId);
+        for (int i = 1; i <= 8; i++) {
+            cluster.coordinator(leaderId).submit(leader, "snap-k" + i, "v" + i);
+        }
+        log.info("[demo-压缩] 领导者存档位点={} 保留窗口 first={}（旧日志已整理进存档，未提交内容不在其中）",
+                leader.getSnapshotIndex(), leader.getFirstLogIndex());
+
+        // 全新节点空白加入：先收存档再补增量；加入期间集群继续写
+        cluster.joinNewNode("node4");
+        for (int i = 9; i <= 12; i++) {
+            cluster.coordinator(leaderId).submit(leader, "snap-k" + i, "v" + i);
+        }
+        for (int t = 0; t < 4; t++) {
+            cluster.advance(cluster.getHeartbeatIntervalMillis() + 1L);
+        }
+        RaftNode newcomer = cluster.node("node4");
+        log.info("[demo-追赶] node4 空白加入后：snapshotIndex={} appliedIndex={}/{}（存档+增量补齐，期间写入未中断）",
+                newcomer.getSnapshotIndex(), newcomer.getLastApplied(), leader.getLastApplied());
+        // 旧键在新节点重试，只回放首次结论
+        WriteResult r = cluster.coordinator("node4").submit(newcomer, "snap-k1", "tampered");
+        log.info("[demo-追赶] node4 重试旧幂等键 snap-k1 dedupHit={} value={}（恰好一次，不重复计数）",
+                r.dedupHit(), r.value());
+    }
+
     private ClusterSimulator newCluster() {
         ClusterSimulator cluster = new ClusterSimulator(properties.getNodeCount());
         cluster.setElectionTimeoutMillis(properties.getElectionTimeoutMillis());
         cluster.setHeartbeatIntervalMillis(properties.getHeartbeatIntervalMillis());
         cluster.setLeaseTtlMillis(properties.getLeaseTtlMillis());
+        cluster.setCompactionThresholdEntries(properties.getCompactionThresholdEntries());
         return cluster;
     }
 }
