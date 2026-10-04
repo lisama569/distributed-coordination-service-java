@@ -27,6 +27,9 @@ public enum CoordinationErrorCode {
     /** 位点或任期发生回退，检查点/日志被显式拒绝 */
     CHECKPOINT_ROLLBACK,
 
+    /** 节点掉队超出集群承诺的可恢复窗口：最早可服务位点已被压缩，不允许从中间位点续写 */
+    OUT_OF_RETENTION_WINDOW,
+
     /** 其他内部错误 */
     INTERNAL
 }

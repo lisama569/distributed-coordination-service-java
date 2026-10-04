@@ -57,6 +57,28 @@ public class KvStateMachine {
         return Map.copyOf(data);
     }
 
+    /**
+     * 安装历史压缩存档：把状态机数据整体替换为存档数据，并把已应用位点推进到存档位点。
+     *
+     * <p>存档等价于"从头完整重放 1..includedIndex 的全部已提交日志"，因此安装后状态与
+     * 逐字重放一致；位点只能前进不能回退，回退按 {@code CHECKPOINT_ROLLBACK} 拒绝。
+     * 存档只允许来自已提交应用位点，调用方（RaftNode）负责该前提。
+     */
+    public synchronized void installSnapshot(long includedIndex, long includedTerm, Map<String, String> snapshotData) {
+        if (includedIndex < 0L) {
+            throw new IllegalArgumentException("非法存档位点: " + includedIndex);
+        }
+        if (includedIndex < appliedIndex) {
+            throw new com.github.lisama569.distributedcoordinationservicejava.core.CoordinationException(
+                    com.github.lisama569.distributedcoordinationservicejava.core.CoordinationErrorCode.CHECKPOINT_ROLLBACK,
+                    "状态机拒绝安装旧存档: appliedIndex=" + appliedIndex
+                            + ", snapshotIndex=" + includedIndex);
+        }
+        this.data.clear();
+        this.data.putAll(snapshotData);
+        this.appliedIndex = includedIndex;
+    }
+
     public synchronized long appliedIndex() {
         return appliedIndex;
     }

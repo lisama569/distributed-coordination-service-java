@@ -2,14 +2,19 @@
 
 一个**完全在进程内**运行、用本地测试即可验证的分布式协调服务：用可控逻辑时钟模拟时间、
 用方法调用模拟 RPC、用对象生命周期模拟崩溃与恢复，**不依赖任何外部中间件、网络或多线程**。
-提供三件能力：
+提供五件能力：
 
 1. 基于多数派的**领导者选举与任期管理**（Raft 风格）；
 2. 带**租约与栅栏令牌（Fencing Token）**的分布式锁；
-3. **幂等执行与崩溃恢复**（去重表 + 检查点/日志重放）。
+3. **幂等执行与崩溃恢复**（去重表 + 检查点/日志重放）；
+4. **历史压缩（Log Compaction）**：按可配置规模阈值把已落定历史压成紧凑存档，
+   恢复/新建先装存档再补增量，结果与从头重放一致；
+5. **滞后节点追赶（Catch-up）**：长时间失联/新加入节点靠"存档 + 增量"补齐，
+   追赶期间集群照常写入；掉队超出可恢复窗口时被明确挡回，不假装追平。
 
-结论在双主、租约过期、分区恢复、重复提交等场景下保持一致且可解释——每个失败都被
-显式归类为一种 `CoordinationErrorCode`，日志中打印任期、栅栏令牌、幂等键与判定依据。
+结论在双主、租约过期、分区恢复、重复提交、历史压缩、掉队超窗等场景下保持一致且可解释
+——每个失败都被显式归类为一种 `CoordinationErrorCode`，日志中打印任期、位点、
+幂等键、栅栏令牌与判定依据。
 
 ---
 
@@ -17,14 +22,16 @@
 
 ```
 core/        SimClock（逻辑时钟）、CoordinationErrorCode（错误归类）、CoordinationException
-cluster/     RaftNode（选举/租约/复制/提交）、RPC 记录、ClusterSimulator（集群/分区/崩溃）
+cluster/     RaftNode（选举/租约/复制/提交/压缩/追赶）、RPC 记录（含 InstallSnapshot）、
+             ClusterSimulator（集群/分区/崩溃/重置重加入）
 lock/        LockService、FenceToken、AcquireResult
 log/         LogEntry（日志条目）
-statemachine/KvStateMachine（按位点幂等应用的 K/V 状态机）
-recovery/    DurableStorage、InMemoryDisk（进程内“磁盘”）、Checkpoint
-coordination/WriteCoordinator（幂等去重 + 恢复）
+statemachine/KvStateMachine（按位点幂等应用、可整体安装存档的 K/V 状态机）
+snapshot/    Snapshot（紧凑状态存档：状态机数据 + 已生效幂等索引）
+recovery/    DurableStorage、InMemoryDisk（进程内“磁盘”，存档+增量日志布局）、Checkpoint
+coordination/WriteCoordinator（幂等去重 + 恢复，以节点已应用索引为权威）
 config/      CoordinationProperties（coordination.* 配置）
-demo/        DemoScenarioRunner（启动时一键演示四场景）
+demo/        DemoScenarioRunner（启动时一键演示五场景）
 ```
 
 ---
@@ -103,11 +110,82 @@ demo/        DemoScenarioRunner（启动时一键演示四场景）
 - 检查点 `currentTerm` 变小（任期回退）；
 - 检查点 `lastIndex / appliedIndex` 变小（位点回退）；
 - 日志非连续追加或新日志 term 小于旧日志 term；
-- 状态机被要求应用小于已应用位点的下标。
+- 状态机被要求应用小于已应用位点的下标；
+- 存档位点/任期回退、截断未被存档覆盖的日志、安装更旧的存档。
 
 ---
 
-## 5. 错误归类（`CoordinationErrorCode`）
+## 5. 历史压缩与滞后节点追赶
+
+### 5.1 触发规则与保留窗口
+
+- 磁盘历史由两部分组成：**一份存档 `Snapshot`**（覆盖 `1..lastIncludedIndex` 的
+  已提交应用状态）+ **存档之后保留的增量日志**（下标从 `lastIncludedIndex+1` 开始）。
+- 规模阈值 `coordination.compaction-threshold-entries`（默认 `0` = **关闭压缩**，
+  保持原有行为）：每当存档之外堆积的**已应用**增量达到该条数，就把更老的历史压成存档，
+  并始终在存档之外**保留阈值数量的最新增量**。因此：
+  - 正在提交/返回的当条绝不会被截断；
+  - 落后在"保留窗口"内的节点仍能用增量日志直接追上，不必重装存档。
+- 压缩只在状态机真实 `apply` 之后发生。存储层还有一道硬校验：**存档位点不允许超过
+  已应用位点**，任何尚未确认生效的内容都进不了存档（违反即 `CHECKPOINT_ROLLBACK`）。
+
+### 5.2 存档内容与"等价于完整重放"
+
+`Snapshot` 只包含已落定生效的内容：
+
+- `lastIncludedIndex / lastIncludedTerm`：存档覆盖的最后位点及任期；
+- `currentTerm`：制作时已知的最大任期（单调递增）；
+- `data`：状态机在该位点的**全量** K/V；
+- `idempotent`：该位点（含）之前**全部已生效幂等写**的索引
+  `idempotencyKey -> (term, index, value)`。
+
+节点崩溃恢复或空盘新建时：**先整体安装存档**（状态机与幂等索引一次性到位点 N），
+**再补 N 之后的增量日志**。因此：
+
+- 最终状态、幂等结论与"从 index=1 完整重放全部已提交日志"**严格一致**；
+- 已承诺生效的写入一条不丢（幂等索引随存档保留），未确认生效的内容一条不算。
+
+### 5.3 滞后节点追赶（InstallSnapshot + AppendEntries）
+
+- 领导者心跳时维护每个对端的 `nextIndex`。当对端需要的下一批增量**在领导者本地已被
+  压缩到一条不剩**（`nextIndex <= 领导者 snapIndex`）时，改发 `InstallSnapshot`；
+  对端装完存档后，后续位点继续走 `AppendEntries` 补增量。
+- **追赶不阻塞写入**：复制是异步收敛的，多数派由其余健康副本凑齐，掉队者追赶期间
+  集群照常接受并提交新写。
+- **同一次写不会算两遍**：状态机按日志位点幂等应用，存档是整体替换，增量按位点续接；
+  已在存档里生效的幂等键，补齐后重试直接回放结论，不推进应用位点。
+- 领导者用"成员代次（incarnation）"识别**重置后重加入**的同名节点：代次变化即丢弃
+  该对端旧的复制进度，从存档重新同步，避免拿陈旧 `nextIndex` 对空盘发增量。
+
+### 5.4 可恢复窗口边界（不假装追平、不从中间续写）
+
+`OUT_OF_RETENTION_WINDOW` 是新增的显式失败归类：
+
+- 一个**自带存档覆盖范围之外旧历史**的节点，若它缺的增量已被集群压缩（领导者只能
+  提供一份会抹掉其旧历史的存档），安装请求会被**明确拒绝**，原因
+  `OUT_OF_RETENTION_WINDOW`；
+- 系统既**不覆盖**它的旧历史，也**不允许**它从某个中间位置悄悄续写、更不会把它
+  标记成已追平；领导者侧可通过 `RaftNode.blockedCatchUpPeers()` 查询被挡回的节点
+  及原因。
+- 该类节点的唯一合法恢复路径是**显式重置本地磁盘后重新加入**
+  （`ClusterSimulator.rejoinWithReset`）：空盘 -> 安装存档 -> 补增量，追平后挡回
+  标记自动清除，重新正常参与多数派。
+- 若节点只是装过一份稍旧的存档、尚无存档之外的分叉增量，则允许它就地更新到领导者
+  的更新存档（同属正常追赶），不会被误判为超窗。
+
+### 5.5 对既有语义的兼容（保持不变）
+
+- **选举/任期/租约**逻辑完全不变；压缩只影响日志存储与追赶通道。
+- **幂等恰好一次**：压缩前、压缩后、压缩后重启、换主后重试，同一幂等键都只产生一次
+  写入效果——协调层以接收节点的**已应用幂等索引（存档 + 增量）**为权威依据，重试以
+  首次提交值为准。
+- **租约锁/栅栏令牌**：锁持有关系是独立的领导者内存状态，不参与日志压缩；仍在有效
+  租约内的持有关系不会因压缩中断，`LOCK_CONTENDED / LEASE_EXPIRED /
+  STALE_FENCE_TOKEN` 的区分不变，令牌落后或租约过期的写依旧被拒。
+
+---
+
+## 6. 错误归类（`CoordinationErrorCode`）
 
 | 错误码 | 触发场景 |
 | --- | --- |
@@ -117,13 +195,14 @@ demo/        DemoScenarioRunner（启动时一键演示四场景）
 | `LOCK_CONTENDED` | 锁仍被其他持有者在有效租约内持有 |
 | `STALE_FENCE_TOKEN` | 旧任期/旧代次令牌用于写或释放，锁已被更高令牌持有者拿走 |
 | `STALE_TERM` | 请求任期落后于节点当前任期 |
-| `CHECKPOINT_ROLLBACK` | 任期/日志位点/应用位点回退或非连续追加 |
+| `CHECKPOINT_ROLLBACK` | 任期/日志位点/应用位点/存档位点回退、非连续追加、截断未存档日志、压缩未应用内容 |
+| `OUT_OF_RETENTION_WINDOW` | 节点自带存档之外旧历史、所需增量已被集群压缩：不覆盖不续写，必须显式重置后以存档+增量重加入 |
 
 ---
 
-## 6. 可配置项
+## 7. 可配置项
 
-`src/main/resources/application.properties`（均为**逻辑毫秒**，非真实时间）：
+`src/main/resources/application.properties`（时间项均为**逻辑毫秒**，非真实时间）：
 
 | 键 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -131,19 +210,20 @@ demo/        DemoScenarioRunner（启动时一键演示四场景）
 | `coordination.election-timeout-millis` | `100` | 选举超时 |
 | `coordination.heartbeat-interval-millis` | `30` | 领导者心跳间隔 |
 | `coordination.lease-ttl-millis` | `60` | 领导者/锁租约 TTL |
-| `coordination.run-demo-on-startup` | `false` | 启动时是否演示四个场景 |
+| `coordination.compaction-threshold-entries` | `0` | 历史压缩规模阈值：存档外每堆积多少条**已应用**增量就压缩一次，并始终保留该数量最新增量；`<=0` 关闭压缩（默认关闭，原有行为不变） |
+| `coordination.run-demo-on-startup` | `false` | 启动时是否演示五个场景 |
 
 ---
 
-## 7. 本地验证方法
+## 8. 本地验证方法
 
-### 7.1 单元测试（推荐）
+### 8.1 单元测试（推荐）
 
 ```bash
 mvn test
 ```
 
-覆盖四组共 15 个用例，全部确定性可复现：
+覆盖六组共 25 个用例，全部确定性可复现：
 
 - `LeaderElectionTest`：同任期唯一领导者；隔离领导者→失多数派/租约过期→拒绝写；
   多数派选出更高 term 新领导者；分区恢复无双主、旧任期不覆盖新任期；多轮改选任期单调。
@@ -153,34 +233,46 @@ mvn test
 - `IdempotencyRecoveryTest`：重试/并发重复提交只有一次写入；崩溃重启从检查点恢复、
   不重复应用；旧任期迟到写在落盘前被拒且不留痕、副本在领导者崩溃后仍保有已提交数据；
   任期/位点/应用位点回退被显式拒绝。
+- `LogCompactionCatchUpTest`：压缩后状态/幂等索引与完整重放一致、旧日志前缀被删除；
+  失联节点靠存档+增量补齐、追赶期间照常写入且同一写不重放两遍；**压缩后重启**先装
+  存档再补增量；**换主后重试**旧幂等键仍只回放一次；**超窗节点**被
+  `OUT_OF_RETENTION_WINDOW` 明确挡回、重置后才追平；压缩期间有效租约锁不中断。
+- `SnapshotStorageTest`：存档位点/任期不回退；未应用内容禁止进存档；只截断已被存档
+  覆盖的前缀；安装存档后增量可从存档位点之后续接。
 - `SmokeTest`：基本选举冒烟。
 
-测试日志会打印 **term、栅栏令牌、幂等键、判定依据**，例如：
+测试日志会打印 **term、位点（snapIndex/appliedIndex）、幂等键、栅栏令牌、判定依据**，例如：
 
 ```
+[compact node=node1] 历史压缩完成: 新存档位点 snapIndex=7 snapTerm=1，删除已压缩日志 7 条 ... 保留增量 5 条 (依据: 仅压缩已提交应用位点 1..7)
+[catchup node=node1] 对端 node2 已安装存档至 snapIndex=18，后续改走增量复制
+[idempotent node=node2] 幂等键=bulk-1 命中已生效记录 index=1 term=1 (依据: 节点已应用索引/存档) -> 直接回放，不重复写入
+[scenario-超窗挡回] node2 被在任领导者 node1 明确挡回: ... (判定依据: OUT_OF_RETENTION_WINDOW，不覆盖旧历史、不从中间位点续写)
 [scenario-令牌] 旧持有者迟到写被拒 errorCode=STALE_FENCE_TOKEN 旧令牌=FenceToken(term=1,...) 当前令牌=FenceToken(term=2,...) (判定依据: 栅栏代次已前进)
-[scenario-幂等] 幂等键=order-pay-1001 首次 index=1 term=1；重试结论 dedupHit=true/true,true (判定依据: 去重表命中即回放)
-[scenario-回退] 任期回退被拒 errorCode=CHECKPOINT_ROLLBACK 原因=拒绝任期回退: storedTerm=5, requestedTerm=4
 ```
 
-### 7.2 启动应用一键演示
+### 8.2 启动应用一键演示
 
 ```bash
 mvn spring-boot:run -Dspring-boot.run.arguments="--coordination.run-demo-on-startup=true"
 ```
 
 进程启动后会在日志中依次演示：选举与失多数派拒绝写、锁三类失败、分区恢复无双主、
-幂等 + 崩溃恢复，随后 Web 容器继续运行（`server.port=0` 随机端口）。
+幂等 + 崩溃恢复、**历史压缩 + 存档/增量追赶**，随后 Web 容器继续运行
+（`server.port=0` 随机端口）。演示场景 5 使用固定压缩阈值 5，与配置默认值无关。
 
 ---
 
-## 8. 模拟手段与边界说明
+## 9. 模拟手段与边界说明
 
 - **逻辑时钟**：`SimClock` 只能单调向前推进，所有节点共享；测试用 `cluster.advance(n)`
   精确制造“TTL 到期”“选举超时”，杜绝真实 sleep 的抖动。
 - **网络分区**：`isolate(node)` 让该节点与其余节点双向不可达，RPC 返回空（视作超时）；
   `healPartition()` 恢复连通。
-- **崩溃**：`crash(node)` 删除节点内存对象、保留 `InMemoryDisk`；`restart(node)` 重建。
-- 为保持实现精简，本模拟是**单线程同步**的：选举/复制在一次 tick 或一次写调用内完成，
-  不模拟真实网络乱序、磁盘 fsync 延迟与拜占庭故障；但选举安全性、租约失效、
-  栅栏令牌与幂等去重的判定逻辑与真实 Raft/租约系统一致。
+- **崩溃**：`crash(node)` 删除节点内存对象、保留 `InMemoryDisk`；`restart(node)` 重建，
+  先装存档再补增量。
+- **重置重加入**：`rejoinWithReset(node)` 模拟掉队超窗后的运维动作——清空节点本地
+  历史（成员代次 +1），领导者识别后以存档+增量把它重新补齐。
+- 为保持实现精简，本模拟是**单线程同步**的：选举/复制/压缩/追赶在一次 tick 或一次写
+  调用内完成，不模拟真实网络乱序、磁盘 fsync 延迟与拜占庭故障；但选举安全性、租约失效、
+  栅栏令牌、幂等去重与"只压缩已生效历史、超窗明确挡回"的判定逻辑与真实 Raft/租约系统一致。

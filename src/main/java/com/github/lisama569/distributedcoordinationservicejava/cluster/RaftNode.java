@@ -6,13 +6,14 @@ import com.github.lisama569.distributedcoordinationservicejava.core.SimClock;
 import com.github.lisama569.distributedcoordinationservicejava.log.LogEntry;
 import com.github.lisama569.distributedcoordinationservicejava.recovery.Checkpoint;
 import com.github.lisama569.distributedcoordinationservicejava.recovery.DurableStorage;
+import com.github.lisama569.distributedcoordinationservicejava.snapshot.Snapshot;
 import com.github.lisama569.distributedcoordinationservicejava.statemachine.KvStateMachine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -34,6 +35,28 @@ import java.util.Set;
  *   <li>失去多数派后 TTL 内无法续约，{@link #propose} 一律以 LEASE_EXPIRED/NOT_LEADER 拒绝；</li>
  *   <li>分区恢复时旧领导者一旦收到更高 term 响应/请求立即下台，绝不以旧 term 接受写。</li>
  * </ul>
+ *
+ * <h3>历史压缩（Log Compaction）</h3>
+ * <ul>
+ *   <li>每当已应用位点相对存档位点推进了 {@code compactionThresholdEntries} 条，就把
+ *       <b>截至已应用位点</b>的历史压成一份 {@link Snapshot}：含状态机全量数据与全部
+ *       已生效幂等写索引，随后删除被覆盖的旧日志前缀；</li>
+ *   <li>只压缩已提交应用的内容，未确认生效的日志永远进不了存档，已承诺生效的写入
+ *       一条都不会丢（幂等索引一并进存档）；</li>
+ *   <li>崩溃恢复 / 全新节点：先安装存档把状态一次性带到存档位点，再补存档之后的增量，
+ *       结果与从头完整重放严格一致。</li>
+ * </ul>
+ *
+ * <h3>滞后节点追赶（Catch-up）</h3>
+ * <ul>
+ *   <li>领导者发现对端 {@code nextIndex} 已落到自己存档位点之前，改推 InstallSnapshot，
+ *       对端装完存档后继续走 AppendEntries 补增量，期间领导者照常接受新写入；</li>
+ *   <li>只有<b>空盘的新/重置节点</b>（或已持有同一存档的幂等重传）才允许整体安装存档；
+ *       自带旧历史、且所需增量已被集群压缩掉的掉队节点会被以
+ *       {@link CoordinationErrorCode#OUT_OF_RETENTION_WINDOW} 明确挡回，
+ *       绝不允许覆盖旧历史、也不允许从某个中间位置悄悄续写。该类节点必须显式重置本地
+ *       磁盘后，才能以"存档 + 增量"重新加入。</li>
+ * </ul>
  */
 public class RaftNode {
 
@@ -47,12 +70,18 @@ public class RaftNode {
     private final long electionTimeoutMillis;
     private final long heartbeatIntervalMillis;
     private final long leaseTtlMillis;
+    /** 已应用位点相对存档位点每推进多少条触发一次压缩；&lt;=0 表示关闭压缩 */
+    private final long compactionThresholdEntries;
     /** 每个节点固定的选举超时扰动，避免同时超时导致分票 */
     private final long electionJitter;
 
     // ---- 持久化状态（内存镜像，权威数据在 storage） ----
     private long currentTerm;
     private String votedFor;
+
+    // ---- 存档位点（与磁盘存档一致；无存档时为 0） ----
+    private long snapIndex;
+    private long snapTerm;
 
     // ---- 易失状态 ----
     private NodeRole role = NodeRole.FOLLOWER;
@@ -65,13 +94,28 @@ public class RaftNode {
     private final Map<String, Long> nextIndex = new HashMap<>();
     private final Map<String, Long> matchIndex = new HashMap<>();
     private final Set<String> votesGranted = new HashSet<>();
+    /** 已被告知"超出可恢复窗口、必须重置"的对端（重置后下一轮存档推送自动清除） */
+    private final Map<String, String> blockedCatchUp = new LinkedHashMap<>();
+    /** 领导者记录的各对端成员代次：变化即说明对端已清空历史重加入，旧复制进度作废 */
+    private final Map<String, Long> peerIncarnations = new HashMap<>();
     private long leaseExpireAtMillis = Long.MIN_VALUE;
     private long nextHeartbeatAt;
+
+    /** 已生效幂等写索引（权威）：idempotencyKey -> (term,index,value)，压缩时整体进存档 */
+    private final Map<String, Snapshot.IdempotentRecord> appliedIdempotent = new LinkedHashMap<>();
 
     public RaftNode(String nodeId, SimClock clock, DurableStorage storage,
                     KvStateMachine stateMachine, ClusterTransport transport,
                     long electionTimeoutMillis, long heartbeatIntervalMillis,
                     long leaseTtlMillis) {
+        this(nodeId, clock, storage, stateMachine, transport,
+                electionTimeoutMillis, heartbeatIntervalMillis, leaseTtlMillis, 0L);
+    }
+
+    public RaftNode(String nodeId, SimClock clock, DurableStorage storage,
+                    KvStateMachine stateMachine, ClusterTransport transport,
+                    long electionTimeoutMillis, long heartbeatIntervalMillis,
+                    long leaseTtlMillis, long compactionThresholdEntries) {
         this.nodeId = nodeId;
         this.clock = clock;
         this.storage = storage;
@@ -80,6 +124,7 @@ public class RaftNode {
         this.electionTimeoutMillis = electionTimeoutMillis;
         this.heartbeatIntervalMillis = heartbeatIntervalMillis;
         this.leaseTtlMillis = leaseTtlMillis;
+        this.compactionThresholdEntries = compactionThresholdEntries;
         // 以节点号做确定性扰动，保证各节点超时时刻错开且可重现
         this.electionJitter = Math.floorMod(nodeId.hashCode(), 25L);
         recover();
@@ -92,20 +137,41 @@ public class RaftNode {
         Checkpoint cp = storage.loadCheckpoint();
         this.currentTerm = cp.currentTerm();
         this.votedFor = cp.votedFor();
+
+        // 第一步：先安装存档，把状态机与幂等索引一次性带到存档位点
+        Snapshot snapshot = storage.loadSnapshot();
+        this.snapIndex = snapshot.lastIncludedIndex();
+        this.snapTerm = snapshot.lastIncludedTerm();
+        if (snapIndex > 0L) {
+            stateMachine.installSnapshot(snapIndex, snapTerm, snapshot.data());
+            appliedIdempotent.clear();
+            appliedIdempotent.putAll(snapshot.idempotent());
+            log.info("[recover node={}] 加载历史存档: snapIndex={} snapTerm={} 存档幂等记录={} 条 (依据: 存档等价于重放 1..snapIndex)",
+                    nodeId, snapIndex, snapTerm, snapshot.idempotent().size());
+        }
+
+        // 第二步：补存档之后、检查点之前（已提交应用）的增量日志
         this.commitIndex = cp.appliedIndex();
-        this.lastApplied = cp.appliedIndex();
-        // 把已提交日志按顺序重放到状态机；同一位点重放不产生重复效果
-        for (long i = 1L; i <= lastApplied; i++) {
+        this.lastApplied = snapIndex;
+        for (long i = snapIndex + 1L; i <= cp.appliedIndex(); i++) {
             LogEntry e = storage.loadEntry(i);
-            if (e != null) {
-                stateMachine.apply(i, keyOf(e), e.value());
+            if (e == null) {
+                throw new CoordinationException(CoordinationErrorCode.INTERNAL,
+                        "恢复失败: 存档之后缺少已提交日志 index=" + i + " snapIndex=" + snapIndex);
             }
+            stateMachine.apply(i, keyOf(e), e.value());
+            rememberIdempotent(e);
+            lastApplied = i;
+        }
+        // 兼容旧检查点（无存档）：appliedIndex 即权威应用位点
+        if (lastApplied < cp.appliedIndex()) {
+            lastApplied = cp.appliedIndex();
         }
         this.role = NodeRole.FOLLOWER;
         this.leaderId = null;
         this.leaseExpireAtMillis = Long.MIN_VALUE;
-        log.info("[recover node={}] 从检查点恢复: term={}, lastIndex={}, appliedIndex={}",
-                nodeId, currentTerm, storage.lastIndex(), lastApplied);
+        log.info("[recover node={}] 恢复完成: term={} snapIndex={} lastIndex={} appliedIndex={}",
+                nodeId, currentTerm, snapIndex, storage.lastIndex(), lastApplied);
     }
 
     // ==================== 时钟驱动 ====================
@@ -189,17 +255,19 @@ public class RaftNode {
         leaderId = nodeId;
         nextIndex.clear();
         matchIndex.clear();
+        blockedCatchUp.clear();
+        peerIncarnations.clear();
         for (String peer : transport.nodeIds()) {
             if (!peer.equals(nodeId)) {
                 nextIndex.put(peer, localLastIndex() + 1L);
-                matchIndex.put(peer, 0L);
+                matchIndex.put(peer, snapIndex);
             }
         }
         // 当选即发一轮心跳：既宣告领导权，也尝试立刻获得多数派 ACK 以建立租约
         broadcastHeartbeats();
         nextHeartbeatAt = clock.nowMillis() + heartbeatIntervalMillis;
-        log.info("[elect node={}] 成为领导者 term={} 集群规模={}",
-                nodeId, currentTerm, transport.nodeIds().size());
+        log.info("[elect node={}] 成为领导者 term={} 集群规模={} snapIndex={}",
+                nodeId, currentTerm, transport.nodeIds().size(), snapIndex);
     }
 
     private void becomeFollower(long term, String newLeaderId) {
@@ -261,7 +329,7 @@ public class RaftNode {
         }
     }
 
-    // ==================== 心跳与复制 ====================
+    // ==================== 心跳、快照追赶与复制 ====================
 
     private void broadcastHeartbeats() {
         int total = transport.nodeIds().size();
@@ -270,12 +338,34 @@ public class RaftNode {
             if (peer.equals(nodeId)) {
                 continue;
             }
+            // 新加入或"重置后重加入"的对端：磁盘已清空、旧 nextIndex 作废。
+            // 用成员代次识别"同名但已重置"的对端，丢弃旧复制进度，从存档位点开始同步。
+            long incarnation = transport.incarnationOf(peer);
+            Long knownIncarnation = peerIncarnations.get(peer);
+            if (knownIncarnation == null || knownIncarnation != incarnation) {
+                nextIndex.put(peer, snapIndex + 1L);
+                matchIndex.put(peer, snapIndex);
+                blockedCatchUp.remove(peer);
+                peerIncarnations.put(peer, incarnation);
+                log.info("[catchup node={}] 发现（重新）加入的对端 {} (代次={})，从存档位点 snapIndex={} 开始同步",
+                        nodeId, peer, incarnation, snapIndex);
+            }
             long ni = nextIndex.getOrDefault(peer, localLastIndex() + 1L);
-            long prevLogIndex = ni - 1L;
-            long prevLogTerm = prevLogIndex == 0L ? 0L : termAt(prevLogIndex);
             List<LogEntry> batch = storage.loadEntries(ni);
-            AppendRequest request = new AppendRequest(currentTerm, nodeId, prevLogIndex,
-                    prevLogTerm, commitIndex, batch);
+            long prevIndexForPeer = ni - 1L;
+            long prevTermForPeer = termAt(prevIndexForPeer);
+            // 何时必须推存档：对端需要的这批增量，我本地已经一条都不剩了
+            // （ni 已被我压缩进存档）。注意 prevIndex 恰好等于我存档位点时是合法的
+            // AppendEntries 边界（对端装过同一存档，用空/后续批量即可对齐），不能误推快照。
+            boolean peerNeedsSnapshot = ni <= snapIndex;
+            if (peerNeedsSnapshot) {
+                if (sendSnapshot(peer)) {
+                    acks++;
+                }
+                continue;
+            }
+            AppendRequest request = new AppendRequest(currentTerm, nodeId, prevIndexForPeer,
+                    prevTermForPeer, commitIndex, batch);
             Optional<AppendResponse> reply = transport.sendAppendEntries(nodeId, peer, request);
             if (reply.isEmpty()) {
                 continue;
@@ -290,11 +380,12 @@ public class RaftNode {
             }
             if (resp.success()) {
                 acks++;
-                long matched = prevLogIndex + batch.size();
+                long matched = prevIndexForPeer + batch.size();
                 matchIndex.put(peer, matched);
                 nextIndex.put(peer, matched + 1L);
             } else {
-                // 对端日志落后或冲突：nextIndex 回退一格，下一轮继续追
+                // 对端日志落后或冲突：nextIndex 回退一格；下一轮若连 prevLog 任期都无法
+                // 从本地历史解析，会自动改走 InstallSnapshot（见方法前的 peerNeedsSnapshot）。
                 nextIndex.put(peer, Math.max(1L, ni - 1L));
             }
         }
@@ -306,6 +397,99 @@ public class RaftNode {
             advanceCommitIndex();
         }
         applyCommitted();
+    }
+
+    /**
+     * 领导者向落后对端推送本地存档。
+     *
+     * @return 对端是否接受（接受/可计入 ACK）；被明确挡回（超出可恢复窗口）时返回 false
+     */
+    private boolean sendSnapshot(String peer) {
+        Snapshot snapshot = storage.loadSnapshot();
+        InstallSnapshotRequest request = new InstallSnapshotRequest(currentTerm, nodeId, snapshot);
+        Optional<InstallSnapshotResponse> reply = transport.sendInstallSnapshot(nodeId, peer, request);
+        if (reply.isEmpty()) {
+            return false;
+        }
+        InstallSnapshotResponse resp = reply.get();
+        if (resp.term() > currentTerm) {
+            becomeFollower(resp.term(), null);
+            return false;
+        }
+        if (role != NodeRole.LEADER) {
+            return false;
+        }
+        if (resp.success()) {
+            blockedCatchUp.remove(peer);
+            matchIndex.put(peer, snapshot.lastIncludedIndex());
+            nextIndex.put(peer, snapshot.lastIncludedIndex() + 1L);
+            log.info("[catchup node={}] 对端 {} 已安装存档至 snapIndex={}，后续改走增量复制",
+                    nodeId, peer, snapshot.lastIncludedIndex());
+            return true;
+        }
+        if (CoordinationErrorCode.OUT_OF_RETENTION_WINDOW.name().equals(resp.reason())) {
+            String detail = "对端 " + peer + " 自带旧历史且所需位点 " + (snapIndex + 1L)
+                    + " 已超出其可恢复窗口(本地最早可服务位点=" + snapIndex
+                    + ")，必须重置本地磁盘后以存档+增量重新加入";
+            blockedCatchUp.put(peer, detail);
+            log.warn("[catchup node={}] {}（不覆盖旧历史、不从中间位点续写）",
+                    nodeId, detail);
+        }
+        return false;
+    }
+
+    public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
+        if (request.term() < currentTerm) {
+            return InstallSnapshotResponse.reject(currentTerm, 0L, CoordinationErrorCode.STALE_TERM.name());
+        }
+        if (request.term() > currentTerm) {
+            becomeFollower(request.term(), request.leaderId());
+        } else {
+            // 同 term：承认对端领导权
+            role = NodeRole.FOLLOWER;
+            leaderId = request.leaderId();
+            resetElectionTimer();
+        }
+        Snapshot incoming = request.snapshot();
+
+        if (incoming.lastIncludedIndex() < snapIndex) {
+            // 领导者的存档比我本地的还旧：它不可能是合法领导者（日志更旧），明确拒绝
+            log.info("[catchup node={}] 拒绝旧存档: incomingSnap={} < localSnap={}",
+                    nodeId, incoming.lastIncludedIndex(), snapIndex);
+            return InstallSnapshotResponse.reject(currentTerm, snapIndex,
+                    CoordinationErrorCode.CHECKPOINT_ROLLBACK.name());
+        }
+        boolean cleanDisk = snapIndex == 0L && storage.lastIndex() == 0L;
+        boolean sameSnapshot = incoming.lastIncludedIndex() == snapIndex;
+        // 对端没有"存档覆盖范围之外、会被新存档抹掉"的本地日志时，允许（重新）安装：
+        //  - 空盘的新/重置节点（cleanDisk）；
+        //  - 幂等重传同一份存档（sameSnapshot）；
+        //  - 已装过旧存档、尚无存档之外增量（storage.lastIndex()==snapIndex）：
+        //    只是把权威状态更新得更全，属于正常追赶，不是从中间位点续写。
+        boolean hasOnlySnapshotState = storage.lastIndex() == snapIndex;
+        if (!cleanDisk && !sameSnapshot && !hasOnlySnapshotState) {
+            // 本地仍带着存档覆盖范围之外的旧历史，而所需增量已被集群压缩：
+            // 不覆盖、不续写，明确挡回，要求显式重置后以存档+增量重新加入。
+            log.warn("[catchup node={}] 拒绝整体安装存档: 本地存在存档之外的旧历史 snapIndex={} lastIndex={}，"
+                            + "incomingSnap={}（超出可恢复窗口，需显式重置后重加入）",
+                    nodeId, snapIndex, storage.lastIndex(), incoming.lastIncludedIndex());
+            return InstallSnapshotResponse.reject(currentTerm, snapIndex,
+                    CoordinationErrorCode.OUT_OF_RETENTION_WINDOW.name());
+        }
+
+        Checkpoint installed = storage.installSnapshot(incoming);
+        stateMachine.installSnapshot(incoming.lastIncludedIndex(),
+                incoming.lastIncludedTerm(), incoming.data());
+        appliedIdempotent.clear();
+        appliedIdempotent.putAll(incoming.idempotent());
+        this.snapIndex = incoming.lastIncludedIndex();
+        this.snapTerm = incoming.lastIncludedTerm();
+        this.commitIndex = installed.appliedIndex();
+        this.lastApplied = installed.appliedIndex();
+        log.info("[catchup node={}] 安装领导者存档 snapIndex={} snapTerm={} 幂等记录={} 条，"
+                        + "状态已与从头重放一致，等待位点 {} 之后的增量",
+                nodeId, snapIndex, snapTerm, incoming.idempotent().size(), snapIndex + 1L);
+        return InstallSnapshotResponse.ok(currentTerm, snapIndex);
     }
 
     public AppendResponse handleAppendEntries(AppendRequest request) {
@@ -323,10 +507,16 @@ public class RaftNode {
         long prevIndex = request.prevLogIndex();
         long prevTerm = request.prevLogTerm();
         if (prevIndex > 0L) {
-            LogEntry prev = storage.loadEntry(prevIndex);
-            if (prev == null || prev.term() != prevTerm) {
-                log.debug("[append node={}] 拒绝: prevLog[{}/term={}] 不匹配",
-                        nodeId, prevIndex, prevTerm);
+            long knownPrevTerm = termAt(prevIndex);
+            if (knownPrevTerm == 0L || knownPrevTerm != prevTerm) {
+                if (prevIndex <= snapIndex) {
+                    // 需要的前序位点已被本地压缩：普通 Append 无法服务，提示领导者改推存档
+                    log.debug("[append node={}] 拒绝: prevLog[{}] 已被本地存档覆盖 snapIndex={}",
+                            nodeId, prevIndex, snapIndex);
+                } else {
+                    log.debug("[append node={}] 拒绝: prevLog[{}/term={}] 不匹配",
+                            nodeId, prevIndex, prevTerm);
+                }
                 return new AppendResponse(currentTerm, false, 0L);
             }
         }
@@ -335,14 +525,28 @@ public class RaftNode {
             long idx = baseIndex + 1L;
             LogEntry existing = storage.loadEntry(idx);
             if (existing == null) {
+                if (idx < storage.firstRetainedIndex()) {
+                    // 该位点已被本地存档覆盖，绝不能再写：交给领导者通过快照对齐
+                    log.debug("[append node={}] 拒绝: idx={} 已被本地存档覆盖 snapIndex={}",
+                            nodeId, idx, snapIndex);
+                    return new AppendResponse(currentTerm, false, snapIndex);
+                }
+                if (idx != storage.lastIndex() + 1L) {
+                    // 中间存在空洞：说明缺更早的增量（或需要快照），拒绝并让领导者回退 nextIndex；
+                    // 注意安装存档后 lastIndex()==snapIndex，因此首条 snapIndex+1 能正常续上
+                    log.debug("[append node={}] 拒绝: idx={} 存在空洞 lastIndex={} snapIndex={}",
+                            nodeId, idx, storage.lastIndex(), snapIndex);
+                    return new AppendResponse(currentTerm, false, snapIndex);
+                }
                 storage.appendEntry(new LogEntry(idx, incoming.term(),
                         incoming.idempotencyKey(), incoming.value()));
             } else if (existing.term() != incoming.term()) {
-                // 冲突：本模拟没有截断 API，而单领导者顺序提交下不会走到这里；
-                // 显式拒绝比静默覆盖安全。
-                throw new CoordinationException(CoordinationErrorCode.CHECKPOINT_ROLLBACK,
-                        "日志在 index=" + idx + " 处任期冲突: existing=" + existing.term()
-                                + ", incoming=" + incoming.term());
+                // 任期冲突：删掉该位点及之后的后缀，用领导者日志覆盖（标准 Raft 冲突处理）
+                log.info("[append node={}] index={} 任期冲突 existing={} incoming={}，截断后缀并覆盖",
+                        nodeId, idx, existing.term(), incoming.term());
+                storage.truncateFrom(idx);
+                storage.appendEntry(new LogEntry(idx, incoming.term(),
+                        incoming.idempotencyKey(), incoming.value()));
             }
             // existing 且 term 相同：幂等忽略（重复投递）
             baseIndex = idx;
@@ -393,17 +597,61 @@ public class RaftNode {
                 break;
             }
             String appliedValue = stateMachine.apply(idx, keyOf(entry), entry.value());
+            rememberIdempotent(entry);
             lastApplied = idx;
             persistAppliedCheckpoint();
             log.info("[apply node={}] 应用日志 index={} term={} idempotencyKey={} value={}",
                     nodeId, idx, entry.term(), entry.idempotencyKey(), appliedValue);
         }
+        maybeCompact();
+    }
+
+    private void rememberIdempotent(LogEntry entry) {
+        if (entry.idempotencyKey() != null) {
+            appliedIdempotent.putIfAbsent(entry.idempotencyKey(),
+                    new Snapshot.IdempotentRecord(entry.term(), entry.index(), entry.value()));
+        }
+    }
+
+    // ==================== 历史压缩 ====================
+
+    /**
+     * 规模阈值触发：当存档之外堆积的已应用增量达到 {@code compactionThresholdEntries} 条时，
+     * 把更老的历史压进存档，并始终在存档之外保留 threshold 条最新增量
+     * （因此正在提交/返回的当条绝不会被截断，落后在窗口内的节点仍能用增量追上）。
+     * 存档来源只有"状态机当前全量数据 + 已生效幂等索引"，二者都只由已提交应用的日志产生。
+     */
+    private void maybeCompact() {
+        if (compactionThresholdEntries <= 0L) {
+            return;
+        }
+        // 存档之外保留 threshold 条增量：压缩到 lastApplied - threshold
+        long compactThrough = lastApplied - compactionThresholdEntries;
+        if (compactThrough <= snapIndex) {
+            return;
+        }
+        long compactTerm = termAt(compactThrough);
+        Map<String, String> data = stateMachine.snapshot();
+        Map<String, Snapshot.IdempotentRecord> idempotent = Map.copyOf(appliedIdempotent);
+        Snapshot snapshot = new Snapshot(compactThrough, compactTerm, currentTerm,
+                Map.copyOf(data), idempotent);
+        storage.saveSnapshot(snapshot);
+        storage.compactPrefixThrough(compactThrough);
+        long removed = compactThrough - snapIndex;
+        this.snapIndex = compactThrough;
+        this.snapTerm = compactTerm;
+        log.info("[compact node={}] 历史压缩完成: 新存档位点 snapIndex={} snapTerm={}，"
+                        + "删除已压缩日志 {} 条，存档含 K/V {} 项、幂等记录 {} 条，保留增量 {} 条 "
+                        + "(依据: 仅压缩已提交应用位点 1..{})",
+                nodeId, snapIndex, snapTerm, removed, data.size(), idempotent.size(),
+                storage.lastIndex() - snapIndex, compactThrough);
     }
 
     // ==================== 写入 ====================
 
     /**
      * 领导者接收写请求：校验身份与租约 -> 本地持久化 -> 复制到多数派 -> 提交应用。
+     * 复制过程中若有对端在靠存档追赶，不阻塞本写入：多数派由其余健康副本凑齐。
      */
     public LogEntry propose(String idempotencyKey, String value) {
         long now = clock.nowMillis();
@@ -452,7 +700,18 @@ public class RaftNode {
         return storage.lastTerm();
     }
 
+    /**
+     * 指定位点的任期：先看增量日志；位点已被存档覆盖（index &lt;= snapIndex）时，
+     * 该范围属于已提交历史，统一回落到存档任期（推进提交位点只需比较旧 term 与当前 term）；
+     * 位点在存档之后但日志缺失返回 0。
+     */
     private long termAt(long index) {
+        if (index == 0L) {
+            return 0L;
+        }
+        if (index <= snapIndex) {
+            return snapTerm;
+        }
         LogEntry e = storage.loadEntry(index);
         return e == null ? 0L : e.term();
     }
@@ -496,6 +755,15 @@ public class RaftNode {
         return lastApplied;
     }
 
+    /** 当前存档覆盖到位点（无存档返回 0）：更早的位点已不再保留原始日志。 */
+    public long getSnapshotIndex() {
+        return snapIndex;
+    }
+
+    public long getSnapshotTerm() {
+        return snapTerm;
+    }
+
     public boolean isLeader() {
         return role == NodeRole.LEADER;
     }
@@ -509,8 +777,25 @@ public class RaftNode {
         return leaseExpireAtMillis;
     }
 
+    /**
+     * 权威幂等索引查询：某幂等键是否已在本节点生效（无论来自原始日志还是历史存档）。
+     * 协调层据此保证压缩、换主、追赶后的重试都只产生一次写入效果。
+     */
+    public Snapshot.IdempotentRecord findAppliedIdempotent(String idempotencyKey) {
+        return appliedIdempotent.get(idempotencyKey);
+    }
+
+    public String readState(String key) {
+        return stateMachine.read(key);
+    }
+
+    /** 当前被本节点（领导者视角）挡在可恢复窗口之外、必须重置后重加入的对端及原因。 */
+    public Map<String, String> blockedCatchUpPeers() {
+        return Map.copyOf(blockedCatchUp);
+    }
+
     public List<LogEntry> logView() {
-        return storage.loadEntries(1L);
+        return storage.loadEntries(snapIndex + 1L);
     }
 
     public static UnsupportedOperationException todo() {

@@ -40,6 +40,7 @@ public class DemoScenarioRunner implements ApplicationRunner {
         demoLeaseLockFailures();
         demoPartitionHealNoDualLeader();
         demoIdempotencyAndCrashRecovery();
+        demoCompactionAndCatchUp();
         log.info("================ 本地演示结束 ================");
     }
 
@@ -123,8 +124,35 @@ public class DemoScenarioRunner implements ApplicationRunner {
                 afterRestart.dedupHit(), afterRestart.index());
     }
 
+    private void demoCompactionAndCatchUp() {
+        log.info("---- 场景5：历史压缩 + 落后节点存档/增量追赶 + 超窗挡回 ----");
+        // 演示用固定阈值 5，独立于 application.properties 的默认关闭设置
+        ClusterSimulator cluster = new ClusterSimulator(3, 5L);
+        String leaderId = cluster.awaitLeader();
+        RaftNode leader = cluster.node(leaderId);
+        for (int i = 1; i <= 18; i++) {
+            cluster.coordinator(leaderId).submit(leader, "hist-" + i, "h" + i);
+        }
+        log.info("[demo-压缩] 18 条写入后领导者存档位点 snapIndex={}（阈值=5，存档外保留 5 条增量）",
+                leader.getSnapshotIndex());
+
+        // 新节点（空盘）加入：先装存档再补增量，追平后旧幂等键重试仍只生效一次
+        String joiner = "node4";
+        cluster.addNode(joiner);
+        for (int t = 0; t < 10; t++) {
+            cluster.advance(properties.getHeartbeatIntervalMillis());
+        }
+        RaftNode caught = cluster.node(joiner);
+        WriteResult replay = cluster.coordinator(joiner)
+                .submit(caught, "hist-1", "should-replay");
+        log.info("[demo-追赶] 新节点 {} 追平 appliedIndex={}/{}(领导者)，旧幂等键重试 dedupHit={} 值={}",
+                joiner, caught.getLastApplied(), leader.getLastApplied(),
+                replay.dedupHit(), replay.value());
+    }
+
     private ClusterSimulator newCluster() {
-        ClusterSimulator cluster = new ClusterSimulator(properties.getNodeCount());
+        ClusterSimulator cluster = new ClusterSimulator(properties.getNodeCount(),
+                properties.getCompactionThresholdEntries());
         cluster.setElectionTimeoutMillis(properties.getElectionTimeoutMillis());
         cluster.setHeartbeatIntervalMillis(properties.getHeartbeatIntervalMillis());
         cluster.setLeaseTtlMillis(properties.getLeaseTtlMillis());

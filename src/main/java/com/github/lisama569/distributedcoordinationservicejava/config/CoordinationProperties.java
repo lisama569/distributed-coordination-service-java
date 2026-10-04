@@ -20,6 +20,13 @@ public class CoordinationProperties {
     /** 领导者租约 TTL（逻辑毫秒）：TTL 内无多数派心跳 ACK 则租约失效。 */
     private long leaseTtlMillis = 60L;
 
+    /**
+     * 历史压缩规模阈值：已应用位点相对存档位点每推进多少条日志，就把截至已应用位点的
+     * 历史压缩成一份存档并删除被覆盖的旧日志前缀。{@code <=0} 表示关闭压缩（默认关闭，
+     * 保持原有行为）。存档只含已提交应用内容，恢复时先装存档再补增量。
+     */
+    private long compactionThresholdEntries = 0L;
+
     /** 启动时是否运行演示场景并打印结论日志。 */
     private boolean runDemoOnStartup = false;
 
@@ -31,6 +38,8 @@ public class CoordinationProperties {
     public void setHeartbeatIntervalMillis(long v) { this.heartbeatIntervalMillis = v; }
     public long getLeaseTtlMillis() { return leaseTtlMillis; }
     public void setLeaseTtlMillis(long v) { this.leaseTtlMillis = v; }
+    public long getCompactionThresholdEntries() { return compactionThresholdEntries; }
+    public void setCompactionThresholdEntries(long v) { this.compactionThresholdEntries = v; }
     public boolean isRunDemoOnStartup() { return runDemoOnStartup; }
     public void setRunDemoOnStartup(boolean v) { this.runDemoOnStartup = v; }
 }
