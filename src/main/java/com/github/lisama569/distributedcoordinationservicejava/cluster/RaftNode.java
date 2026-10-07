@@ -49,8 +49,13 @@ import java.util.Set;
  *
  * <h3>滞后节点追赶（Catch-up）</h3>
  * <ul>
- *   <li>领导者发现对端 {@code nextIndex} 已落到自己存档位点之前，改推 InstallSnapshot，
- *       对端装完存档后继续走 AppendEntries 补增量，期间领导者照常接受新写入；</li>
+ *   <li>AppendEntries 拒绝时携带冲突任期/位点提示，领导者据此<b>一轮</b>把 nextIndex
+ *       跳到真正分叉处（而不是每轮只回退一格）：纯滞后一轮补齐整段增量、任期分叉两轮
+ *       对齐，追赶轮数基本不随落后多少而变长；领导者发现对端所需位点已被自己压缩进
+ *       存档时改推 InstallSnapshot，对端装完存档后继续走 AppendEntries 补增量，
+ *       空盘（重置/全新）节点在代次识别下一轮即收到存档；</li>
+ *   <li>追赶期间领导者照常接受新写入，多数派由健康副本凑齐，补数据不阻塞提交；
+ *       存档整体安装 + 增量按位点严格续接，同一次写不会被算两遍；</li>
  *   <li>只有<b>空盘的新/重置节点</b>（或已持有同一存档的幂等重传）才允许整体安装存档；
  *       自带旧历史、且所需增量已被集群压缩掉的掉队节点会被以
  *       {@link CoordinationErrorCode#OUT_OF_RETENTION_WINDOW} 明确挡回，
@@ -109,7 +114,8 @@ public class RaftNode {
                     long electionTimeoutMillis, long heartbeatIntervalMillis,
                     long leaseTtlMillis) {
         this(nodeId, clock, storage, stateMachine, transport,
-                electionTimeoutMillis, heartbeatIntervalMillis, leaseTtlMillis, 0L);
+                electionTimeoutMillis, heartbeatIntervalMillis, leaseTtlMillis,
+                ClusterSimulator.DEFAULT_COMPACTION_THRESHOLD_ENTRIES);
     }
 
     public RaftNode(String nodeId, SimClock clock, DurableStorage storage,
@@ -256,7 +262,8 @@ public class RaftNode {
         nextIndex.clear();
         matchIndex.clear();
         blockedCatchUp.clear();
-        peerIncarnations.clear();
+        // 注意：peerIncarnations 不清空——代次记忆必须跨任期保留，才能识别
+        // "同名但已清空磁盘重加入"的对端；同代次对端一律按乐观位点首次探测。
         for (String peer : transport.nodeIds()) {
             if (!peer.equals(nodeId)) {
                 nextIndex.put(peer, localLastIndex() + 1L);
@@ -342,13 +349,27 @@ public class RaftNode {
             // 用成员代次识别"同名但已重置"的对端，丢弃旧复制进度，从存档位点开始同步。
             long incarnation = transport.incarnationOf(peer);
             Long knownIncarnation = peerIncarnations.get(peer);
-            if (knownIncarnation == null || knownIncarnation != incarnation) {
-                nextIndex.put(peer, snapIndex + 1L);
+            if (knownIncarnation == null) {
+                // 首次见到该代次的对端：先按乐观位点（领导者日志尾之后）尝试——
+                // 健康对端一轮心跳即可 ACK；落后/分叉对端会带冲突提示拒绝，下一轮直达。
+                nextIndex.put(peer, localLastIndex() + 1L);
+                matchIndex.put(peer, snapIndex);
+                peerIncarnations.put(peer, incarnation);
+            } else if (knownIncarnation != incarnation) {
+                // 同名节点代次变化 = 已显式清空本地历史重加入：旧进度作废，
+                // 本地已有存档时 nextIndex 直接对准存档位点，本轮就推 InstallSnapshot；
+                // 无存档时从首条日志开始。
+                nextIndex.put(peer, snapIndex > 0L ? snapIndex : 1L);
                 matchIndex.put(peer, snapIndex);
                 blockedCatchUp.remove(peer);
                 peerIncarnations.put(peer, incarnation);
-                log.info("[catchup node={}] 发现（重新）加入的对端 {} (代次={})，从存档位点 snapIndex={} 开始同步",
-                        nodeId, peer, incarnation, snapIndex);
+                log.info("[catchup node={}] 对端 {} 已重置重加入(代次 {} -> {})，从存档位点 snapIndex={} 开始同步",
+                        nodeId, peer, knownIncarnation, incarnation, snapIndex);
+            }
+            // 已被明确挡在可恢复窗口之外的对端：在显式重置（代次变化）前不再重复推存档，
+            // 既不假装追平，也不拿无效复制流量干扰；同时不计入 ACK。
+            if (blockedCatchUp.containsKey(peer)) {
+                continue;
             }
             long ni = nextIndex.getOrDefault(peer, localLastIndex() + 1L);
             List<LogEntry> batch = storage.loadEntries(ni);
@@ -384,9 +405,14 @@ public class RaftNode {
                 matchIndex.put(peer, matched);
                 nextIndex.put(peer, matched + 1L);
             } else {
-                // 对端日志落后或冲突：nextIndex 回退一格；下一轮若连 prevLog 任期都无法
-                // 从本地历史解析，会自动改走 InstallSnapshot（见方法前的 peerNeedsSnapshot）。
-                nextIndex.put(peer, Math.max(1L, ni - 1L));
+                // 对端拒绝：按冲突任期/位点提示一轮跳到分叉处，追赶轮数与落后条数无关。
+                long backtrackTo = resolveRejectedNextIndex(resp);
+                nextIndex.put(peer, backtrackTo);
+                matchIndex.put(peer, Math.min(matchIndex.getOrDefault(peer, snapIndex), backtrackTo - 1L));
+                log.info("[catchup node={}] 对端 {} 拒绝增量(对端snap={} 冲突任期={} 冲突位点={})，"
+                                + "nextIndex {} -> {} (依据: 冲突任期跳转，至多再经一轮存档/增量即对齐)",
+                        nodeId, peer, resp.peerSnapIndex(), resp.conflictTerm(), resp.conflictIndex(),
+                        ni, backtrackTo);
             }
         }
         if (role != NodeRole.LEADER) {
@@ -494,7 +520,7 @@ public class RaftNode {
 
     public AppendResponse handleAppendEntries(AppendRequest request) {
         if (request.term() < currentTerm) {
-            return new AppendResponse(currentTerm, false, 0L);
+            return AppendResponse.reject(currentTerm, 0L, 0L, snapIndex);
         }
         if (request.term() > currentTerm) {
             becomeFollower(request.term(), request.leaderId());
@@ -509,15 +535,31 @@ public class RaftNode {
         if (prevIndex > 0L) {
             long knownPrevTerm = termAt(prevIndex);
             if (knownPrevTerm == 0L || knownPrevTerm != prevTerm) {
+                AppendResponse hint;
                 if (prevIndex <= snapIndex) {
-                    // 需要的前序位点已被本地压缩：普通 Append 无法服务，提示领导者改推存档
+                    // 需要的前序位点已被本地存档覆盖：普通 Append 无法服务，提示领导者改推存档。
+                    // conflictTerm=0 + 冲突位点=prevIndex(<=领导者snap时它会识别) ；
+                    // 同时明确带上本地存档位点。
                     log.debug("[append node={}] 拒绝: prevLog[{}] 已被本地存档覆盖 snapIndex={}",
                             nodeId, prevIndex, snapIndex);
+                    hint = AppendResponse.reject(currentTerm, 0L, prevIndex, snapIndex);
                 } else {
-                    log.debug("[append node={}] 拒绝: prevLog[{}/term={}] 不匹配",
-                            nodeId, prevIndex, prevTerm);
+                    LogEntry conflictEntry = storage.loadEntry(prevIndex);
+                    if (conflictEntry == null) {
+                        // 该位点缺日志（空洞/我更短）：告知我的日志尾，让领导者一轮跳到我尾部
+                        log.debug("[append node={}] 拒绝: prevLog[{}] 缺失，本地日志尾={}",
+                                nodeId, prevIndex, storage.lastIndex());
+                        hint = AppendResponse.reject(currentTerm, 0L, storage.lastIndex(), snapIndex);
+                    } else {
+                        // 任期冲突：告知该任期在我本地的首条位点，领导者一轮跳到真正分叉处
+                        long conflictTerm = conflictEntry.term();
+                        long firstOfTerm = firstIndexOfRetainedTerm(conflictTerm);
+                        log.debug("[append node={}] 拒绝: prevLog[{}/term={}] 与本地任期 {} 冲突，任期首条位点={}",
+                                nodeId, prevIndex, prevTerm, conflictTerm, firstOfTerm);
+                        hint = AppendResponse.reject(currentTerm, conflictTerm, firstOfTerm, snapIndex);
+                    }
                 }
-                return new AppendResponse(currentTerm, false, 0L);
+                return hint;
             }
         }
         long baseIndex = prevIndex;
@@ -529,14 +571,15 @@ public class RaftNode {
                     // 该位点已被本地存档覆盖，绝不能再写：交给领导者通过快照对齐
                     log.debug("[append node={}] 拒绝: idx={} 已被本地存档覆盖 snapIndex={}",
                             nodeId, idx, snapIndex);
-                    return new AppendResponse(currentTerm, false, snapIndex);
+                    return AppendResponse.reject(currentTerm, 0L, idx, snapIndex);
                 }
                 if (idx != storage.lastIndex() + 1L) {
-                    // 中间存在空洞：说明缺更早的增量（或需要快照），拒绝并让领导者回退 nextIndex；
-                    // 注意安装存档后 lastIndex()==snapIndex，因此首条 snapIndex+1 能正常续上
+                    // 中间存在空洞：说明缺更早的增量（或需要快照），把本地日志尾告诉领导者，
+                    // 它一轮即可回跳到正确位点；注意安装存档后 lastIndex()==snapIndex，
+                    // 因此首条 snapIndex+1 能正常续上
                     log.debug("[append node={}] 拒绝: idx={} 存在空洞 lastIndex={} snapIndex={}",
                             nodeId, idx, storage.lastIndex(), snapIndex);
-                    return new AppendResponse(currentTerm, false, snapIndex);
+                    return AppendResponse.reject(currentTerm, 0L, storage.lastIndex(), snapIndex);
                 }
                 storage.appendEntry(new LogEntry(idx, incoming.term(),
                         incoming.idempotencyKey(), incoming.value()));
@@ -557,7 +600,18 @@ public class RaftNode {
         }
         applyCommitted();
         long matched = prevIndex + request.entries().size();
-        return new AppendResponse(currentTerm, true, matched);
+        return AppendResponse.ok(currentTerm, matched);
+    }
+
+    /** 在存档之后保留的增量日志中，查找指定任期第一条日志的位点。 */
+    private long firstIndexOfRetainedTerm(long term) {
+        for (long i = snapIndex + 1L; i <= storage.lastIndex(); i++) {
+            LogEntry e = storage.loadEntry(i);
+            if (e != null && e.term() == term) {
+                return i;
+            }
+        }
+        return storage.lastIndex();
     }
 
     public void handleAppendResponse(String fromId, AppendResponse response) {
@@ -701,6 +755,73 @@ public class RaftNode {
     }
 
     /**
+     * 依据对端拒绝时的冲突任期/位点提示，一步算出下一轮应当使用的 nextIndex。
+     *
+     * <ul>
+     *   <li>所需位点我已压进存档（对端 conflictTerm=0 且其冲突位点不晚于我的存档位点，
+     *       或跳转目标落到存档覆盖范围内）：返回 snapIndex，下一轮直接 InstallSnapshot；</li>
+     *   <li>冲突任期在我的存档之后且本地仍有该任期：跳到该任期最后一条位点（标准 Raft
+     *       XTerm 优化的保守取法，保证不会越过我自己的分叉点），下一轮一次对齐；</li>
+     *   <li>冲突任期比我保留日志全部任期都新（对端多出我没有的任期）：取它提示的
+     *       conflictIndex+1，交由 Raft 冲突覆盖处理；</li>
+     *   <li>纯缺日志（conflictTerm=0）：取对端日志尾的下一位点，最多 snapIndex+1。</li>
+     * </ul>
+     */
+    private long resolveRejectedNextIndex(AppendResponse resp) {
+        long peerConflictTerm = resp.conflictTerm();
+        long peerConflictIndex = resp.conflictIndex();
+        // 对端需要的前序位点已经被我压缩进存档：只能靠存档补齐
+        if (peerConflictIndex > 0L && peerConflictIndex <= snapIndex) {
+            return snapIndex;
+        }
+        long firstRetained = snapIndex + 1L;
+        long localLast = localLastIndex();
+        if (localLast < firstRetained) {
+            // 本地存档之外没有任何增量可发：只能推存档
+            return snapIndex;
+        }
+        long retainedFirstTerm = termAt(firstRetained);
+        if (peerConflictTerm == 0L) {
+            // 对端缺日志（空洞/更短/空盘）：
+            //  - 它的日志尾还在我存档覆盖范围内（含空盘 conflictIndex=0）-> 增量没有共同
+            //    前缀可接，只能改推存档；
+            //  - 否则从它日志尾的下一条开始发增量。
+            if (peerConflictIndex < firstRetained) {
+                return snapIndex;
+            }
+            return peerConflictIndex + 1L;
+        }
+        if (peerConflictTerm < retainedFirstTerm) {
+            // 分叉任期整体已被我压进存档覆盖范围：增量无法调和，改推存档
+            return snapIndex;
+        }
+        Long lastIndexOfTerm = lastIndexOfRetainedTerm(peerConflictTerm);
+        if (lastIndexOfTerm != null) {
+            return lastIndexOfTerm + 1L;
+        }
+        // 我保留的日志里没有该任期（对端在更新任期上有我没有的条目）
+        long target = Math.max(firstRetained, peerConflictIndex + 1L);
+        return target;
+    }
+
+    /** 在存档之后仍保留的增量日志中，查找指定任期的最后一条日志位点；不存在返回 null。 */
+    private Long lastIndexOfRetainedTerm(long term) {
+        long found = -1L;
+        for (long i = snapIndex + 1L; i <= localLastIndex(); i++) {
+            LogEntry e = storage.loadEntry(i);
+            if (e == null) {
+                break;
+            }
+            if (e.term() == term) {
+                found = i;
+            } else if (e.term() > term) {
+                break;
+            }
+        }
+        return found < 0L ? null : found;
+    }
+
+    /**
      * 指定位点的任期：先看增量日志；位点已被存档覆盖（index &lt;= snapIndex）时，
      * 该范围属于已提交历史，统一回落到存档任期（推进提交位点只需比较旧 term 与当前 term）；
      * 位点在存档之后但日志缺失返回 0。
@@ -796,6 +917,21 @@ public class RaftNode {
 
     public List<LogEntry> logView() {
         return storage.loadEntries(snapIndex + 1L);
+    }
+
+    /** 存档之外仍保留原始日志的条数：持续压缩下该值应稳定在阈值附近，不再随写入无限增长。 */
+    public int retainedLogSize() {
+        return storage.loadEntries(snapIndex + 1L).size();
+    }
+
+    /** 真正产生写入效果的 apply 次数（每个位点至多一次）。 */
+    public long effectiveApplyCount() {
+        return stateMachine.effectiveApplyCount();
+    }
+
+    /** 同一位点被重复 apply 的次数：追赶/恢复/重传路径下应为 0（或仅崩溃重放预期）。 */
+    public long replayApplyCount() {
+        return stateMachine.replayApplyCount();
     }
 
     public static UnsupportedOperationException todo() {

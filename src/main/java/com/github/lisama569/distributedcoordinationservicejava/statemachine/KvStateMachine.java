@@ -13,6 +13,10 @@ public class KvStateMachine {
 
     private final Map<String, String> data = new LinkedHashMap<>();
     private long appliedIndex;
+    /** 真正产生写入效果的 apply 次数（位点首次应用）。 */
+    private long effectiveApplyCount;
+    /** 同一位点被重复 apply 的次数（重放/重复投递路径，必须不产生第二次写入效果）。 */
+    private long replayApplyCount;
 
     public KvStateMachine() {
     }
@@ -42,10 +46,12 @@ public class KvStateMachine {
         }
         if (index == appliedIndex) {
             // 崩溃恢复后的重放：位点已应用，直接返回现值，不重复写
+            replayApplyCount++;
             return data.get(key);
         }
         data.put(key, value);
         appliedIndex = index;
+        effectiveApplyCount++;
         return value;
     }
 
@@ -81,5 +87,15 @@ public class KvStateMachine {
 
     public synchronized long appliedIndex() {
         return appliedIndex;
+    }
+
+    /** 真正改变状态的应用次数（每个位点至多一次）。 */
+    public synchronized long effectiveApplyCount() {
+        return effectiveApplyCount;
+    }
+
+    /** 同一位点重复应用的次数——用于在测试中断言"同一次写不能被算两遍"。 */
+    public synchronized long replayApplyCount() {
+        return replayApplyCount;
     }
 }

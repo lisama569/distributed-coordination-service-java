@@ -47,8 +47,14 @@ public class ClusterSimulator implements ClusterTransport {
     private long electionTimeoutMillis = 100L;
     private long heartbeatIntervalMillis = 30L;
     private long leaseTtlMillis = 60L;
-    /** 已应用位点相对存档位点每推进多少条触发一次压缩；<=0 关闭。默认关闭以保持原有行为 */
-    private long compactionThresholdEntries = 0L;
+    /**
+     * 已应用位点相对存档位点每推进多少条触发一次压缩；默认 {@link #DEFAULT_COMPACTION_THRESHOLD_ENTRIES}
+     * 即默认交付就开启压缩；显式给 {@code <=0} 才关闭。
+     */
+    private long compactionThresholdEntries = DEFAULT_COMPACTION_THRESHOLD_ENTRIES;
+
+    /** 默认压缩阈值：默认配置下持续写入即会把已落定历史压成紧凑存档并回收旧日志。 */
+    public static final long DEFAULT_COMPACTION_THRESHOLD_ENTRIES = 100L;
 
     public ClusterSimulator() {
         this.clock = new SimClock(0L);
@@ -224,6 +230,13 @@ public class ClusterSimulator implements ClusterTransport {
             log.info("[cluster] 分区恢复: {} 重新连通 @t={}", partitioned, clock.nowMillis());
         }
         partitioned.clear();
+    }
+
+    /** 只恢复单个节点的网络（模拟某个掉线节点单独接回来，其余隔离关系保持不变）。 */
+    public void healNode(String nodeId) {
+        if (partitioned.remove(nodeId)) {
+            log.info("[cluster] 节点 {} 分区恢复、重新连通 @t={}", nodeId, clock.nowMillis());
+        }
     }
 
     public boolean isPartitioned(String nodeId) {

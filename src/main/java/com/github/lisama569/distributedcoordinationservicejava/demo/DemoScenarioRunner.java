@@ -126,28 +126,33 @@ public class DemoScenarioRunner implements ApplicationRunner {
 
     private void demoCompactionAndCatchUp() {
         log.info("---- 场景5：历史压缩 + 落后节点存档/增量追赶 + 超窗挡回 ----");
-        // 演示用固定阈值 5，独立于 application.properties 的默认关闭设置
+        // 演示用较小阈值 5，让 18 条写入就能看到多轮压缩；默认交付阈值是 100（默认即开启）
         ClusterSimulator cluster = new ClusterSimulator(3, 5L);
         String leaderId = cluster.awaitLeader();
         RaftNode leader = cluster.node(leaderId);
         for (int i = 1; i <= 18; i++) {
             cluster.coordinator(leaderId).submit(leader, "hist-" + i, "h" + i);
         }
-        log.info("[demo-压缩] 18 条写入后领导者存档位点 snapIndex={}（阈值=5，存档外保留 5 条增量）",
-                leader.getSnapshotIndex());
+        log.info("[demo-压缩] 18 条写入后领导者存档位点 snapIndex={}（演示阈值=5，存档外保留 5 条增量；"
+                + "默认交付阈值=100，同样默认开启）", leader.getSnapshotIndex());
 
-        // 新节点（空盘）加入：先装存档再补增量，追平后旧幂等键重试仍只生效一次
+        // 新节点（空盘）加入：一轮直接装存档，再一轮补增量；追平后旧幂等键重试仍只生效一次。
+        // 重试请求仍提交到在任领导者，但领导者已通过复制持有该键的已生效幂等索引
+        // （随存档一起复制），直接回放结论、不产生第二条日志。
         String joiner = "node4";
         cluster.addNode(joiner);
         for (int t = 0; t < 10; t++) {
             cluster.advance(properties.getHeartbeatIntervalMillis());
         }
         RaftNode caught = cluster.node(joiner);
-        WriteResult replay = cluster.coordinator(joiner)
-                .submit(caught, "hist-1", "should-replay");
-        log.info("[demo-追赶] 新节点 {} 追平 appliedIndex={}/{}(领导者)，旧幂等键重试 dedupHit={} 值={}",
+        WriteResult replay = cluster.coordinator(leaderId)
+                .submit(leader, "hist-1", "should-replay");
+        log.info("[demo-追赶] 新节点 {} 追平 appliedIndex={}/{}(领导者)，在任领导者对旧幂等键重试 dedupHit={} 值={}",
                 joiner, caught.getLastApplied(), leader.getLastApplied(),
                 replay.dedupHit(), replay.value());
+        // 新节点本地状态也与集群一致
+        log.info("[demo-追赶] 新节点本地读取 hist-1={} hist-18={}（存档+增量补齐，无重复应用 replay={}）",
+                caught.readState("hist-1"), caught.readState("hist-18"), caught.replayApplyCount());
     }
 
     private ClusterSimulator newCluster() {
