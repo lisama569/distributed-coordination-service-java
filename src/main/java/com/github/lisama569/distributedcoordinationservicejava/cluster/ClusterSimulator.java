@@ -44,11 +44,14 @@ public class ClusterSimulator implements ClusterTransport {
 
     private final LockService lockService;
 
+    /** 默认压缩阈值：默认交付即开启历史压缩；<=0 表示显式关闭。 */
+    public static final long DEFAULT_COMPACTION_THRESHOLD_ENTRIES = 64L;
+
     private long electionTimeoutMillis = 100L;
     private long heartbeatIntervalMillis = 30L;
     private long leaseTtlMillis = 60L;
-    /** 已应用位点相对存档位点每推进多少条触发一次压缩；<=0 关闭。默认关闭以保持原有行为 */
-    private long compactionThresholdEntries = 0L;
+    /** 已应用位点相对存档位点每推进多少条触发一次压缩；<=0 关闭。默认开启（64 条） */
+    private long compactionThresholdEntries = DEFAULT_COMPACTION_THRESHOLD_ENTRIES;
 
     public ClusterSimulator() {
         this.clock = new SimClock(0L);

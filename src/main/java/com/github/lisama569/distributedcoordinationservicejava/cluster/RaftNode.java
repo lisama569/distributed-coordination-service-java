@@ -51,6 +51,12 @@ import java.util.Set;
  * <ul>
  *   <li>领导者发现对端 {@code nextIndex} 已落到自己存档位点之前，改推 InstallSnapshot，
  *       对端装完存档后继续走 AppendEntries 补增量，期间领导者照常接受新写入；</li>
+ *   <li><b>快速对齐</b>：AppendEntries 被拒时跟随者回传冲突提示（日志太短 /
+ *       冲突任期首个下标 / 需走快照），领导者据此把 {@code nextIndex} 一次跳到位、
+ *       下一轮整批补齐——无论落后多少条、中间换没换过主，都只需少数几轮心跳，
+ *       而不是逐格回退、落后 N 条拖 N 轮；</li>
+ *   <li>候选者拉票失败会额外退避一个选举超时，避免"日志旧但扰动小"的节点在确定性
+ *       扰动下反复抢先超时、让多数派永远完不成换届（选举活锁）；</li>
  *   <li>只有<b>空盘的新/重置节点</b>（或已持有同一存档的幂等重传）才允许整体安装存档；
  *       自带旧历史、且所需增量已被集群压缩掉的掉队节点会被以
  *       {@link CoordinationErrorCode#OUT_OF_RETENTION_WINDOW} 明确挡回，
@@ -246,8 +252,15 @@ public class RaftNode {
         log.info("[elect node={}] term={} 得票 {}/{}", nodeId, currentTerm, granted, total);
         if (granted * 2 > total) {
             becomeLeader();
+        } else {
+            // 拉票失败（分裂票或日志不够新被拒）：额外退避一个选举超时。
+            // 否则在确定性扰动下，"日志旧但扰动小"的节点会永远抢先超时、
+            // 反复抬高任期并重置他人计时器，使多数派永远完不成换届（选举活锁）；
+            // 退避后日志更新的节点得以先超时当选，再用心跳压制落后候选者。
+            electionDeadline = clock.nowMillis() + 2L * (electionTimeoutMillis + electionJitter);
+            log.info("[elect node={}] term={} 拉票失败，退避至 {} 后再试",
+                    nodeId, currentTerm, electionDeadline);
         }
-        // 否则保持 candidate，等待下一轮超时（term 再 +1）
     }
 
     private void becomeLeader() {
@@ -384,9 +397,14 @@ public class RaftNode {
                 matchIndex.put(peer, matched);
                 nextIndex.put(peer, matched + 1L);
             } else {
-                // 对端日志落后或冲突：nextIndex 回退一格；下一轮若连 prevLog 任期都无法
-                // 从本地历史解析，会自动改走 InstallSnapshot（见方法前的 peerNeedsSnapshot）。
-                nextIndex.put(peer, Math.max(1L, ni - 1L));
+                // 对端日志落后或冲突：按对端回传的冲突提示把 nextIndex 一次性跳到位
+                // （不再每轮只回退一格），落后多少都只需少数几轮即可对齐；
+                // 下一轮若连 prevLog 都无法从本地历史解析，会自动改走 InstallSnapshot。
+                long jumped = nextIndexFromConflictHint(resp, ni);
+                nextIndex.put(peer, jumped);
+                log.info("[catchup node={}] 对端 {} 日志不一致: 按冲突提示 nextIndex {} -> {} "
+                                + "(conflictTerm={} conflictIndex={})，下一轮整批补齐",
+                        nodeId, peer, ni, jumped, resp.conflictTerm(), resp.conflictIndex());
             }
         }
         if (role != NodeRole.LEADER) {
@@ -436,6 +454,84 @@ public class RaftNode {
                     nodeId, detail);
         }
         return false;
+    }
+
+    /**
+     * 按对端回传的冲突提示计算下一轮 nextIndex（Raft 冲突快速回退）：
+     * <ul>
+     *   <li>conflictTerm &lt; 0：对端所需位点已被其存档覆盖，回到位点 1 ——
+     *       下一轮必然触发 InstallSnapshot（或本地无存档时全量对齐）；</li>
+     *   <li>conflictTerm = 0：对端日志太短，直接跳到对端 lastIndex+1；</li>
+     *   <li>conflictTerm &gt; 0：若本地持有该任期条目则跳到其最后一条之后，
+     *       否则跳到对端给出的冲突段首个下标。</li>
+     * </ul>
+     * 提示只让 nextIndex 回退、绝不前进（钳制在 currentNext-1 以内），因此不会发散。
+     */
+    private long nextIndexFromConflictHint(AppendResponse resp, long currentNext) {
+        long hint;
+        if (resp.conflictTerm() < 0L) {
+            hint = 1L;
+        } else if (resp.conflictTerm() == 0L) {
+            hint = resp.conflictIndex();
+        } else {
+            long lastOfTerm = lastIndexOfTerm(resp.conflictTerm());
+            hint = lastOfTerm > 0L ? lastOfTerm + 1L : resp.conflictIndex();
+        }
+        return Math.max(1L, Math.min(hint, currentNext - 1L));
+    }
+
+    /**
+     * 本地日志中指定任期的最后一个下标（不存在返回 0）。日志内任期单调非降，二分查找。
+     * 该任期已被本地存档覆盖时保守返回存档位点（等价于"从存档边界之后开始对齐"）。
+     */
+    private long lastIndexOfTerm(long term) {
+        if (term <= 0L) {
+            return 0L;
+        }
+        if (snapIndex > 0L && term <= snapTerm) {
+            return term == snapTerm ? snapIndex : 0L;
+        }
+        long lo = snapIndex + 1L, hi = storage.lastIndex(), ans = 0L;
+        while (lo <= hi) {
+            long mid = (lo + hi) >>> 1;
+            long t = termAt(mid);
+            if (t == term) {
+                ans = mid;
+                lo = mid + 1L;
+            } else if (t == 0L || t > term) {
+                hi = mid - 1L;
+            } else {
+                lo = mid + 1L;
+            }
+        }
+        return ans;
+    }
+
+    /**
+     * 本地日志中指定任期的首个下标（不存在返回 0）。日志内任期单调非降，二分查找。
+     * 该任期即存档任期时，首个可见下标即存档位点本身。
+     */
+    private long firstIndexOfTerm(long term) {
+        if (term <= 0L) {
+            return 0L;
+        }
+        if (snapIndex > 0L && term <= snapTerm) {
+            return term == snapTerm ? snapIndex : 0L;
+        }
+        long lo = snapIndex + 1L, hi = storage.lastIndex(), ans = 0L;
+        while (lo <= hi) {
+            long mid = (lo + hi) >>> 1;
+            long t = termAt(mid);
+            if (t == term) {
+                ans = mid;
+                hi = mid - 1L;
+            } else if (t == 0L || t > term) {
+                hi = mid - 1L;
+            } else {
+                lo = mid + 1L;
+            }
+        }
+        return ans;
     }
 
     public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
@@ -508,16 +604,27 @@ public class RaftNode {
         long prevTerm = request.prevLogTerm();
         if (prevIndex > 0L) {
             long knownPrevTerm = termAt(prevIndex);
-            if (knownPrevTerm == 0L || knownPrevTerm != prevTerm) {
+            if (knownPrevTerm == 0L) {
+                // prevLog 超出本地日志范围：本地日志太短，提示领导者直接跳到 lastIndex+1
+                log.debug("[append node={}] 拒绝: prevLog[{}] 超出本地日志 lastIndex={}，"
+                        + "回传提示 nextIndex={}", nodeId, prevIndex,
+                        storage.lastIndex(), storage.lastIndex() + 1L);
+                return AppendResponse.rejectLogTooShort(currentTerm, storage.lastIndex());
+            }
+            if (knownPrevTerm != prevTerm) {
                 if (prevIndex <= snapIndex) {
-                    // 需要的前序位点已被本地压缩：普通 Append 无法服务，提示领导者改推存档
+                    // 需要的前序位点已被本地存档覆盖且任期对不上：普通 Append 无法服务，
+                    // 提示领导者改推存档
                     log.debug("[append node={}] 拒绝: prevLog[{}] 已被本地存档覆盖 snapIndex={}",
                             nodeId, prevIndex, snapIndex);
-                } else {
-                    log.debug("[append node={}] 拒绝: prevLog[{}/term={}] 不匹配",
-                            nodeId, prevIndex, prevTerm);
+                    return AppendResponse.rejectNeedsSnapshot(currentTerm, snapIndex);
                 }
-                return new AppendResponse(currentTerm, false, 0L);
+                // prevLog 任期冲突：回传冲突任期及其在本地日志中的首个下标
+                long firstIdx = firstIndexOfTerm(knownPrevTerm);
+                log.debug("[append node={}] 拒绝: prevLog[{}/term={}] 与本地 term={} 冲突，"
+                        + "回传提示 conflictIndex={}", nodeId, prevIndex, prevTerm,
+                        knownPrevTerm, firstIdx);
+                return AppendResponse.rejectTermConflict(currentTerm, knownPrevTerm, firstIdx);
             }
         }
         long baseIndex = prevIndex;
@@ -529,14 +636,15 @@ public class RaftNode {
                     // 该位点已被本地存档覆盖，绝不能再写：交给领导者通过快照对齐
                     log.debug("[append node={}] 拒绝: idx={} 已被本地存档覆盖 snapIndex={}",
                             nodeId, idx, snapIndex);
-                    return new AppendResponse(currentTerm, false, snapIndex);
+                    return AppendResponse.rejectNeedsSnapshot(currentTerm, snapIndex);
                 }
                 if (idx != storage.lastIndex() + 1L) {
-                    // 中间存在空洞：说明缺更早的增量（或需要快照），拒绝并让领导者回退 nextIndex；
+                    // 中间存在空洞：说明缺更早的增量（或需要快照），拒绝并提示领导者
+                    // 直接跳到本地日志末尾之后（一轮到位，不再逐格回退）；
                     // 注意安装存档后 lastIndex()==snapIndex，因此首条 snapIndex+1 能正常续上
                     log.debug("[append node={}] 拒绝: idx={} 存在空洞 lastIndex={} snapIndex={}",
                             nodeId, idx, storage.lastIndex(), snapIndex);
-                    return new AppendResponse(currentTerm, false, snapIndex);
+                    return AppendResponse.rejectLogTooShort(currentTerm, storage.lastIndex());
                 }
                 storage.appendEntry(new LogEntry(idx, incoming.term(),
                         incoming.idempotencyKey(), incoming.value()));
@@ -557,7 +665,7 @@ public class RaftNode {
         }
         applyCommitted();
         long matched = prevIndex + request.entries().size();
-        return new AppendResponse(currentTerm, true, matched);
+        return AppendResponse.ok(currentTerm, matched);
     }
 
     public void handleAppendResponse(String fromId, AppendResponse response) {

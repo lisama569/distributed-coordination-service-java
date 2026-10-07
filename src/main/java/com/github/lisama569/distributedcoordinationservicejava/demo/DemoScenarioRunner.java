@@ -126,7 +126,8 @@ public class DemoScenarioRunner implements ApplicationRunner {
 
     private void demoCompactionAndCatchUp() {
         log.info("---- 场景5：历史压缩 + 落后节点存档/增量追赶 + 超窗挡回 ----");
-        // 演示用固定阈值 5，独立于 application.properties 的默认关闭设置
+        // 演示用较小阈值 5 让压缩更快可见；默认交付阈值见
+        // ClusterSimulator.DEFAULT_COMPACTION_THRESHOLD_ENTRIES（64，默认即开启压缩）
         ClusterSimulator cluster = new ClusterSimulator(3, 5L);
         String leaderId = cluster.awaitLeader();
         RaftNode leader = cluster.node(leaderId);

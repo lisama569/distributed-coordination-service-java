@@ -37,6 +37,66 @@ class LogCompactionCatchUpTest {
     }
 
     @Test
+    void defaultConfigCompactsAndReclaimsOldLogs_underContinuousWrites() {
+        // 默认交付（不显式设置任何压缩配置）就必须开启压缩
+        com.github.lisama569.distributedcoordinationservicejava.config.CoordinationProperties props =
+                new com.github.lisama569.distributedcoordinationservicejava.config.CoordinationProperties();
+        assertTrue(props.getCompactionThresholdEntries() > 0L,
+                "默认配置必须开启历史压缩，实际阈值=" + props.getCompactionThresholdEntries());
+        assertEquals(ClusterSimulator.DEFAULT_COMPACTION_THRESHOLD_ENTRIES,
+                props.getCompactionThresholdEntries(),
+                "Spring 配置默认值必须与集群模拟器默认阈值一致");
+
+        // 默认构造（不传阈值）持续写入：较早历史必须被压成存档、旧日志必须被回收
+        ClusterSimulator cluster = new ClusterSimulator(3);
+        String leaderId = cluster.awaitLeader();
+        RaftNode leader = cluster.node(leaderId);
+        long threshold = ClusterSimulator.DEFAULT_COMPACTION_THRESHOLD_ENTRIES;
+
+        int total = 200;
+        for (int i = 1; i <= total; i++) {
+            cluster.coordinator(leaderId).submit(leader, "def-" + i, "v" + i);
+        }
+        long snap = leader.getSnapshotIndex();
+        long applied = leader.getLastApplied();
+        int retained = leader.logView().size();
+        log.info("[scenario-默认压缩] 默认阈值={} 持续写入={} 条后 snapIndex={} appliedIndex={} "
+                        + "保留增量={} 条 (判定依据: 默认配置即触发压缩，存档外只保留阈值条增量)",
+                threshold, total, snap, applied, retained);
+
+        assertEquals(total, applied, "全部写入必须已提交应用");
+        assertTrue(snap > 0L, "默认配置下持续写入必须触发压缩，实际 snapIndex=" + snap);
+        assertTrue(snap >= total - threshold,
+                "压缩必须跟上写入节奏（snapIndex >= total - threshold），实际 snapIndex=" + snap);
+        assertTrue(retained <= threshold,
+                "旧日志必须被回收：存档外保留增量不得超过阈值，实际=" + retained);
+
+        // 状态与从头完整重放一致，一条已生效写入都不能少
+        for (int i = 1; i <= total; i++) {
+            assertEquals("v" + i, leader.readState("def-" + i),
+                    "默认压缩后状态必须与完整重放一致: def-" + i);
+        }
+        // 已被压缩的幂等键重试：命中存档内索引，不二次写入
+        WriteResult retry = cluster.coordinator(leaderId).submit(leader, "def-1", "other");
+        assertTrue(retry.dedupHit());
+        assertEquals(1L, retry.index());
+        assertEquals("v1", retry.value());
+        // 各 follower 也通过复制/压缩收敛到同一存档位点附近，且状态一致
+        // （提交位点经心跳广播，给两拍让 follower 应用到最后一条）
+        for (int t = 0; t < 3; t++) {
+            cluster.advance(cluster.getHeartbeatIntervalMillis());
+        }
+        for (RaftNode n : cluster.nodes()) {
+            for (int i = 1; i <= total; i++) {
+                assertEquals("v" + i, n.readState("def-" + i),
+                        "节点 " + n.getNodeId() + " 状态必须与完整重放一致: def-" + i);
+            }
+        }
+        log.info("[scenario-默认压缩] 三节点状态与完整重放一致，幂等键=def-1 重试 dedupHit={} "
+                + "(判定依据: 存档幂等索引随压缩保留)", retry.dedupHit());
+    }
+
+    @Test
     void compactionProducesStateIdenticalToFullReplay_andDropsOldLogs() {
         ClusterSimulator cluster = clusterWithCompaction(3, 5L);
         String leaderId = cluster.awaitLeader();
